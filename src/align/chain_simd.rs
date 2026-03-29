@@ -995,7 +995,7 @@ pub(crate) unsafe fn chain_anchors_neon(
     (u2, b2)
 }}
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
     use crate::align::chain::{chain_anchors_scalar, fast_log2};

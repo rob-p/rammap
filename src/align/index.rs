@@ -459,7 +459,7 @@ impl Index {
         // Helper: sketch one sequence and distribute entries to bucket arrays.
         fn sketch_to_buckets(
             rid: usize, ascii: &[u8], len: usize, w: usize, k: usize, is_hpc: bool,
-            buckets: &mut Vec<Vec<(u64, u64)>>, mask: u64,
+            buckets: &mut [Vec<(u64, u64)>], mask: u64,
         ) {
             let mut minimizers = Vec::new();
             sketch_sequence(ascii, len, w, k, rid, is_hpc, &mut minimizers);
@@ -502,7 +502,7 @@ impl Index {
                 let count = i - start;
                 if max_occ < usize::MAX && count > max_occ { continue; }
                 let offset = positions.len() as u64;
-                for j in start..i { positions.push(b[j].1); }
+                for it in b.iter().take(i).skip(start) { positions.push(it.1); }
                 lookup.insert(h, (offset << 32) | count as u64);
             }
         }
