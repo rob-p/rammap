@@ -50,7 +50,15 @@ src/
     chain_simple.rs     (215)  # Greedy chain scoring (simple/fast)
     filter.rs           (375)  # Parent assignment + secondary filtering
     extend.rs          (2117)  # Anchor extension, gap-fill, CIGAR generation, CS/MD/DS formatters
-    dp.rs             (10616)  # SIMD DP engine (SSE2/SSE4.1/AVX2/AVX512/NEON, 3 algorithm variants)
+
+    dp/                        # SIMD DP engine (~10.7K lines, split by algorithm)
+      mod.rs             (832)  # Re-exports public API, tests (SIMD concordance)
+      common.rs          (827)  # Types (DpResult), constants, flags, memory mgmt, traceback
+      single.rs         (1917)  # Single-affine gap: SSE2/4.1/AVX2/AVX512/NEON/WASM/scalar
+      dual.rs           (3069)  # Dual-affine gap: SSE2/4.1/AVX2/AVX512/NEON/WASM/scalar
+      splice.rs         (3450)  # Splice-aware: SSE2/4.1/AVX2/AVX512/NEON/WASM/scalar
+      lw.rs              (612)  # Lightweight i16 Smith-Waterman + global NW alignment
+
     pipeline.rs        (2649)  # End-to-end pipeline: process_query, format_output, MAPQ, PE
     pair.rs             (250)  # Paired-end logic (concordant pairing, PE MAPQ)
     junc.rs             (295)  # Junction annotation scoring (BED/SPSC for splice)
@@ -391,28 +399,29 @@ score[i] = max(
 
 ---
 
-### dp.rs — SIMD Dynamic Programming
+### dp/ — SIMD Dynamic Programming (~10.7K lines)
 
-**Purpose**: SIMD-accelerated banded DP alignment. Three algorithm variants across six platform targets (SSE2, SSE4.1, AVX2, AVX512BW, NEON, WASM SIMD128) plus scalar fallback.
+**Purpose**: SIMD-accelerated banded DP alignment. Three algorithm variants across six platform targets (SSE2, SSE4.1, AVX2, AVX512BW, NEON, WASM SIMD128) plus scalar fallback. Split into sub-modules by algorithm:
 
-**Key types**:
-- `DpResult` — Alignment result with score tracking at multiple positions (see [Data Structures](#5-key-data-structures))
-- `LightweightProfile` — Pre-computed query profile for fast Smith-Waterman scoring
-- `AlignedMemory` — Raw aligned allocation for DP matrices
+| Module | Lines | Contents |
+|--------|------:|---------|
+| `dp/common.rs` | 827 | Types (`DpResult`, `LightweightProfile`), constants, alignment flags, memory management (`AlignedMemory`, `DP_MEM_CACHE`), WASM SIMD compat layer, x86 SIMD helpers, traceback functions |
+| `dp/single.rs` | 1,917 | Single-affine gap: `cost = q + k*e`. All SIMD variants + scalar + dispatch |
+| `dp/dual.rs` | 3,069 | Dual-affine gap: `cost = min(q+k*e, q2+k*e2)`. All SIMD variants + scalar + dispatch |
+| `dp/splice.rs` | 3,450 | Splice-aware: GT-AG junction detection + bonus. All SIMD variants + scalar + dispatch |
+| `dp/lw.rs` | 612 | Lightweight i16 Smith-Waterman (no traceback) + global NW alignment |
+| `dp/mod.rs` | 832 | Module declarations, `pub use` re-exports, SIMD concordance tests |
 
-**Public API (3 extension + 2 lightweight + 1 global)**:
-- `extend_single_affine(qseq, tseq, alpha_size, mat, q, e, bw, zdrop, end_bonus, flags, result)` — Single-affine gap: `cost = q + k*e`
-- `extend_dual_affine(qseq, tseq, alpha_size, mat, q, e, q2, e2, bw, zdrop, end_bonus, flags, result)` — Dual-affine gap: `cost = min(q + k*e, q2 + k*e2)`. Used for most long-read modes.
-- `extend_splice(qseq, tseq, alpha_size, mat, q, e, q2, noncan, zdrop, end_bonus, junc_bonus, junc_pen, flags, junc_array, result)` — Splice-aware: GT-AG junction detection + bonus scoring
-- `lightweight_profile_init(qlen, query, alpha_size, mat) -> LightweightProfile` — Build query profile for Smith-Waterman
-- `lightweight_align_i16(qp, tlen, target, q, e) -> (score, q_off, t_off)` — Quick scoring without traceback
-- `global_align(qseq, tseq, alpha_size, mat, q, e, bw, result)` — Global NW (SIMD or Gotoh scalar)
+Each algorithm module contains all its SIMD variants (SSE2/SSE4.1 via macro, AVX2 macro, AVX512 macro, NEON, WASM) plus scalar fallback — keeping all code for one algorithm together.
 
-**Scalar fallbacks**: `extend_single_affine_scalar()`, `extend_dual_affine_scalar()`, `extend_splice_scalar()`, `lightweight_align_i16_scalar()`, `global_align_gotoh()`.
+**Public API** (re-exported from `dp/mod.rs`):
+- `extend_single_affine(...)` — Single-affine gap dispatch
+- `extend_dual_affine(...)` — Dual-affine gap dispatch (used for most long-read modes)
+- `extend_splice(...)` — Splice-aware dispatch
+- `lightweight_profile_init(...)` / `lightweight_align_i16(...)` — Quick scoring without traceback
+- `global_align(...)` — Global NW (SIMD or Gotoh scalar)
 
-**AVX2/AVX512 kernels**: Full implementations of all three DP variants (single-affine, dual-affine, splice) at 32 and 64 lanes respectively. Uses 16-byte boundary rounding (matching SSE) with byte-addressed loads/stores to ensure bit-exact scoring across all SIMD widths.
-
-**Key constants** (alignment flags):
+**Key constants** (alignment flags, in `dp/common.rs`):
 
 | Flag | Value | Meaning |
 |------|-------|---------|
@@ -429,11 +438,10 @@ score[i] = max(
 | `SPLICE_COMPLEX` | 0x800 | Complex splice handling |
 | `SPLICE_SCORE` | 0x1000 | Use junction bonus array |
 
-**Shared helpers**:
+**Shared helpers** (in `dp/common.rs`):
 - `push_cigar(cigar, op, len)` — Append CIGAR op (merges consecutive same-op)
-- `alloc_h_array(approx_max, tlen_, simd_width) -> (Vec<i32>, *mut i32)` — Allocate 32-bit H array for exact-max tracking
-- `traceback_single_affine()` / `traceback_dual_affine()` / `traceback_splice()` — Reconstruct CIGAR from DP matrix (unsafe, pointer-based)
-- `traceback_single_affine_safe()` — Safe traceback using slice indexing (used by scalar path)
+- `alloc_h_array(approx_max, tlen_, simd_width)` — Allocate 32-bit H array for exact-max tracking
+- `traceback_dual_affine()` / `traceback_single_affine_safe()` / `traceback_splice()` — CIGAR reconstruction from DP matrix
 - `traceback_start_position()` — Find start position for traceback
 
 **SIMD macro architecture**: See [SIMD Architecture](#7-simd-architecture).
@@ -940,7 +948,7 @@ Adjustments:
 
 ### Platform Support
 
-**DP kernels (dp.rs)**:
+**DP kernels (`dp/single.rs`, `dp/dual.rs`, `dp/splice.rs`)**:
 
 | Platform | Register Type | Width | Dispatch |
 |----------|--------------|-------|----------|
@@ -964,21 +972,20 @@ Note: minimap2 has no SIMD chaining and no AVX2/AVX512 DP kernels (SSE4.1 max).
 
 ### SSE2/SSE4.1 Macro Unification
 
-SSE2 and SSE4.1 share `__m128i` register type and differ in only 3 operations. Three macros unify them:
+SSE2 and SSE4.1 share `__m128i` register type and differ in only 3 operations. Each algorithm file (`dp/single.rs`, `dp/dual.rs`, `dp/splice.rs`) defines its own SSE macro:
 
 ```rust
-macro_rules! extend_single_affine_impl {
-    ($fn_name:ident, $max_epi8:path, $is_sse41:expr, $target_feat:tt) => { ... }
-}
+// In dp/single.rs:
+macro_rules! extend_single_affine_impl { ... }
 
-macro_rules! extend_dual_affine_impl {
-    ($fn_name:ident, $max_epi8:path, $min_epi8:path, $is_sse41:expr, $target_feat:tt) => { ... }
-}
+// In dp/dual.rs:
+macro_rules! extend_dual_affine_impl { ... }
 
-macro_rules! extend_splice_impl {
-    ($fn_name:ident, $max_epi8:path, $is_sse41:expr, $target_feat:tt) => { ... }
-}
+// In dp/splice.rs:
+macro_rules! extend_splice_impl { ... }
 ```
+
+Each macro is instantiated for SSE2, SSE4.1, and WASM within the same file. AVX2 and AVX512 have separate macros (also in the same file) due to different SIMD widths.
 
 **Operation differences**:
 
@@ -999,7 +1006,7 @@ NEON implementations are NOT unified with SSE via macros due to structural diffe
 - `vbslq_u8` (bit select) vs blend
 - Reversed `andnot` argument order
 
-NEON shares only the non-SIMD helpers (init, `push_cigar`, traceback).
+NEON shares only the non-SIMD helpers from `dp/common.rs` (init, `push_cigar`, traceback). All SIMD variants for one algorithm live in the same file (e.g., `dp/dual.rs` contains the SSE, AVX2, AVX512, NEON, WASM, and scalar dual-affine implementations).
 
 ### Runtime Dispatch Pattern
 
@@ -1190,14 +1197,18 @@ All `unsafe` code is confined to SIMD kernels and parallel sort:
 
 | File | Unsafe blocks | Reason |
 |------|:------------:|--------|
-| `dp.rs` | ~110 | SIMD intrinsics (`#[target_feature]` functions), raw pointer DP matrix access, pointer-based traceback |
+| `dp/single.rs` | ~30 | SIMD intrinsics, raw pointer DP matrix access |
+| `dp/dual.rs` | ~35 | SIMD intrinsics, raw pointer DP matrix access, pointer-based traceback |
+| `dp/splice.rs` | ~35 | SIMD intrinsics, raw pointer DP matrix access, pointer-based traceback |
+| `dp/common.rs` | ~5 | SIMD helpers, memory allocation, traceback pointer access |
+| `dp/lw.rs` | ~5 | SIMD intrinsics for lightweight alignment |
 | `chain_simd.rs` | ~15 | AVX2 + NEON chaining kernels with SIMD intrinsics |
 | `chain.rs` | 2 | Dispatch calls to `chain_anchors_avx2` / `chain_anchors_neon` |
 | `sort.rs` | 1 | `from_raw_parts_mut` for parallel non-overlapping mutable slice access in `radix_sort_pair` |
 
-**Zero unsafe** in all other files: `extend.rs`, `pipeline.rs`, `map.rs`, `filter.rs`,
-`seed.rs`, `sketch.rs`, `index.rs`, `index_bucket.rs`, `fasta/`, `api.rs`, `main.rs`,
-`jump.rs`, `junc.rs`, `pair.rs`, `split.rs`, `stats.rs`.
+**Zero unsafe** in all other files: `dp/mod.rs`, `extend.rs`, `pipeline.rs`, `map.rs`,
+`filter.rs`, `seed.rs`, `sketch.rs`, `index.rs`, `index_bucket.rs`, `fasta/`, `api.rs`,
+`main.rs`, `jump.rs`, `junc.rs`, `pair.rs`, `split.rs`, `stats.rs`.
 
 ### Why SIMD Requires Unsafe
 
