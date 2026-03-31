@@ -12,11 +12,11 @@
 //!
 //! let aligner = Aligner::from_index("reference.mmi", Preset::MapOnt).unwrap();
 //! let results = aligner.map_seq("read1", b"ACGTACGTACGT...");
-//! for aln in &results.alignments {
+//! for m in &results.mappings {
 //!     println!("{}\t{}\t{}\t{}\tMAPQ={}",
-//!         aln.target_name, aln.target_start, aln.target_end,
-//!         if aln.strand == Strand::Forward { "+" } else { "-" },
-//!         aln.mapq);
+//!         m.target_name, m.target_start, m.target_end,
+//!         if m.strand == Strand::Forward { "+" } else { "-" },
+//!         m.mapq);
 //! }
 //! ```
 //!
@@ -26,6 +26,7 @@
 //! Each call to `map_seq`/`map_pair` allocates lightweight per-call buffers internally.
 
 use std::io;
+use std::sync::Arc;
 use crate::align::index::Index;
 use crate::align::map::{MapOptions, MapContext, AlignFlags};
 use crate::align::extend::AlignmentContext;
@@ -83,11 +84,39 @@ pub enum Strand {
     Reverse,
 }
 
+/// Structured CIGAR operation (length + op type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CigarOp {
+    /// Operation length.
+    pub len: u32,
+    /// Operation type: 0=M, 1=I, 2=D, 3=N (intron skip).
+    pub op: u8,
+}
+
+impl CigarOp {
+    /// Operation type as a character (M, I, D, N, S, H, =, X).
+    pub fn op_char(&self) -> char {
+        match self.op { 0 => 'M', 1 => 'I', 2 => 'D', 3 => 'N', 4 => 'S', 5 => 'H', 7 => '=', 8 => 'X', _ => '?' }
+    }
+}
+
+/// Per-call options for CS/MD tag generation, overriding the aligner default.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MapOpts {
+    /// Generate CS tag for this call (overrides aligner setting if Some).
+    pub cs: Option<bool>,
+    /// Generate MD tag for this call (overrides aligner setting if Some).
+    pub md: Option<bool>,
+}
+
 /// A single alignment result.
 #[derive(Debug, Clone)]
-pub struct Alignment {
-    /// Target sequence name.
-    pub target_name: String,
+pub struct Mapping {
+    /// Target sequence name (shared via Arc to reduce allocation when many
+    /// alignments reference the same target).
+    pub target_name: Arc<str>,
+    /// Target sequence numeric index in the reference.
+    pub target_id: usize,
     /// Target sequence length.
     pub target_len: usize,
     /// Aligned region start on target (0-based).
@@ -104,6 +133,12 @@ pub struct Alignment {
     pub mapq: i32,
     /// Whether this is a primary alignment.
     pub is_primary: bool,
+    /// Whether this is a supplementary alignment.
+    pub is_supplementary: bool,
+    /// Whether this alignment contains splice junctions (N_SKIP operations).
+    pub is_spliced: bool,
+    /// Transcript strand for splice alignments: None=unknown, Some(Forward)=+, Some(Reverse)=-.
+    pub trans_strand: Option<Strand>,
     /// Number of matching bases.
     pub matches: usize,
     /// Alignment block length.
@@ -112,8 +147,12 @@ pub struct Alignment {
     pub edit_distance: u32,
     /// CIGAR string (if CIGAR output enabled).
     pub cigar: Option<String>,
+    /// Structured CIGAR (if CIGAR output enabled). Each element is (len, op).
+    pub cigar_ops: Option<Vec<CigarOp>>,
     /// CS tag string (if requested).
     pub cs: Option<String>,
+    /// MD tag string (if requested).
+    pub md: Option<String>,
     /// Alignment score (AS tag).
     pub score: i32,
     /// Sequence divergence (0.0 = identical).
@@ -124,13 +163,22 @@ pub struct Alignment {
 #[derive(Debug, Clone)]
 pub struct MapResult {
     /// All alignments for this read, ordered by score (primary first).
-    pub alignments: Vec<Alignment>,
+    pub mappings: Vec<Mapping>,
 }
 
 /// High-level aligner wrapping an index and alignment parameters.
 ///
-/// Construct via [`Aligner::from_index`] or [`Aligner::from_fasta`], then call
-/// [`Aligner::map_seq`] or [`Aligner::map_pair`] per read.
+/// Construct via [`Aligner::from_index`], [`Aligner::from_fasta`], or
+/// [`Aligner::from_seqs`], then call [`Aligner::map_seq`] per read.
+///
+/// # Builder-Style Preset Methods
+///
+/// For minimap2-rs compatibility, preset methods are also available:
+///
+/// ```no_run
+/// use rammap::api::Aligner;
+/// let aligner = Aligner::from_fasta("ref.fa", Aligner::map_ont()).unwrap();
+/// ```
 pub struct Aligner {
     index: Index,
     options: MapOptions,
@@ -138,6 +186,43 @@ pub struct Aligner {
 }
 
 impl Aligner {
+    // --- Preset convenience methods (minimap2-rs compatibility) ---
+
+    /// ONT long read preset.
+    pub fn map_ont() -> Preset { Preset::MapOnt }
+    /// PacBio CLR preset.
+    pub fn map_pb() -> Preset { Preset::MapPb }
+    /// PacBio HiFi preset.
+    pub fn map_hifi() -> Preset { Preset::MapHifi }
+    /// Long read high-quality preset.
+    pub fn lr_hq() -> Preset { Preset::LrHq }
+    /// Long read HQ all-extension preset.
+    pub fn lr_hqae() -> Preset { Preset::LrHqae }
+    /// ICLR preset.
+    pub fn map_iclr() -> Preset { Preset::MapIclr }
+    /// Short read preset.
+    pub fn sr() -> Preset { Preset::Sr }
+    /// Splice (RNA) preset.
+    pub fn splice() -> Preset { Preset::Splice }
+    /// Splice high-quality preset.
+    pub fn splice_hq() -> Preset { Preset::SpliceHq }
+    /// Splice short-read preset.
+    pub fn splice_sr() -> Preset { Preset::SpliceSr }
+    /// cDNA preset.
+    pub fn cdna() -> Preset { Preset::Cdna }
+    /// Assembly 5% divergence preset.
+    pub fn asm5() -> Preset { Preset::Asm5 }
+    /// Assembly 10% divergence preset.
+    pub fn asm10() -> Preset { Preset::Asm10 }
+    /// Assembly 20% divergence preset.
+    pub fn asm20() -> Preset { Preset::Asm20 }
+    /// All-vs-all ONT overlap preset.
+    pub fn ava_ont() -> Preset { Preset::AvaOnt }
+    /// All-vs-all PacBio overlap preset.
+    pub fn ava_pb() -> Preset { Preset::AvaPb }
+
+    // --- Constructors ---
+
     /// Load an aligner from a pre-built minimap2 `.mmi` index file.
     pub fn from_index(path: &str, preset: Preset) -> io::Result<Self> {
         let index = Index::load(path)?;
@@ -146,8 +231,6 @@ impl Aligner {
     }
 
     /// Build an aligner from a FASTA reference file.
-    ///
-    /// This builds the index in memory (may take several seconds for large genomes).
     pub fn from_fasta(path: &str, preset: Preset) -> io::Result<Self> {
         let mut k = 15usize;
         let mut w = 10usize;
@@ -158,50 +241,84 @@ impl Aligner {
         let seqs = crate::fasta::read_fasta(path)?;
         let index = Index::build(seqs, w, k, is_hpc, usize::MAX);
         let out_cfg = OutputConfig {
-            do_cigar: true,
-            do_cs: false,
-            do_md: false,
-            do_ds: false,
-            eqx: false,
-            output_sam: false,
-            rg_id: None,
-            split_mode: false,
+            do_cigar: true, do_cs: false, do_md: false, do_ds: false,
+            eqx: false, output_sam: false, rg_id: None, split_mode: false,
         };
+        opt.seeding.mid_occ = index.cal_mid_occ(2e-4, opt.seeding.min_mid_occ, opt.seeding.max_mid_occ);
         Ok(Aligner { index, options: opt, out_cfg })
     }
 
+    /// Build an aligner from in-memory sequences (name, sequence pairs).
+    ///
+    /// ```no_run
+    /// use rammap::api::{Aligner, Preset};
+    /// let seqs = vec![
+    ///     ("chr1".to_string(), b"ACGTACGT...".to_vec()),
+    ///     ("chr2".to_string(), b"TGCATGCA...".to_vec()),
+    /// ];
+    /// let aligner = Aligner::from_seqs(seqs, Preset::MapOnt);
+    /// ```
+    pub fn from_seqs(seqs: Vec<(String, Vec<u8>)>, preset: Preset) -> Self {
+        let mut k = 15usize;
+        let mut w = 10usize;
+        let mut is_hpc = false;
+        let mut opt = MapOptions::default();
+        apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, preset.as_str());
+        opt.flags.insert(AlignFlags::OUT_CIGAR);
+
+        let index = Index::build(seqs, w, k, is_hpc, usize::MAX);
+        opt.seeding.mid_occ = index.cal_mid_occ(2e-4, opt.seeding.min_mid_occ, opt.seeding.max_mid_occ);
+        let out_cfg = OutputConfig {
+            do_cigar: true, do_cs: false, do_md: false, do_ds: false,
+            eqx: false, output_sam: false, rg_id: None, split_mode: false,
+        };
+        Aligner { index, options: opt, out_cfg }
+    }
+
+    // --- Mapping ---
+
     /// Align a single-end read against the reference.
     pub fn map_seq(&self, name: &str, seq: &[u8]) -> MapResult {
+        self.map_seq_with(name, seq, MapOpts::default())
+    }
+
+    /// Align a single-end read with per-call options (CS/MD toggles).
+    pub fn map_seq_with(&self, name: &str, seq: &[u8], opts: MapOpts) -> MapResult {
         let mut ctx = AlignmentContext::new();
         let mut map_ctx = MapContext::new();
+        let out = self.resolve_out_cfg(&opts);
         let pq = pipeline::process_query(
             &self.options, &self.index, name, seq,
-            &mut ctx, &mut map_ctx, None, &self.out_cfg,
+            &mut ctx, &mut map_ctx, None, &out,
         );
-        to_map_result(&pq, &self.index, &self.out_cfg)
+        to_map_result(&pq, &self.index, &out)
     }
 
     /// Align a paired-end read pair against the reference.
     pub fn map_pair(&self, name: &str, seq1: &[u8], seq2: &[u8]) -> MapResult {
+        self.map_pair_with(name, seq1, seq2, MapOpts::default())
+    }
+
+    /// Align a paired-end read pair with per-call options.
+    pub fn map_pair_with(&self, name: &str, seq1: &[u8], seq2: &[u8], opts: MapOpts) -> MapResult {
         let mut ctx = AlignmentContext::new();
         let mut map_ctx = MapContext::new();
+        let out = self.resolve_out_cfg(&opts);
         let read1 = ReadInfo { qname: name, qseq: seq1, qual: None, comment: None, n_seg: 2, seg_idx: 0 };
         let read2 = ReadInfo { qname: name, qseq: seq2, qual: None, comment: None, n_seg: 2, seg_idx: 1 };
         let (output, _stats) = pipeline::align_and_format_pair(
             &self.options, &self.index, &read1, &read2,
-            &mut ctx, &mut map_ctx, None, &self.out_cfg,
+            &mut ctx, &mut map_ctx, None, &out,
         );
-        // Parse PAF output back into MapResult for the pair case
-        // (align_and_format_pair produces formatted output, not ProcessedQuery)
         parse_paf_to_map_result(&output, &self.index)
     }
 
+    // --- Output ---
+
     /// Format a pre-computed MapResult as a PAF string.
-    ///
-    /// Useful when you want to compute alignments and format separately.
     pub fn format_paf(&self, name: &str, query_len: usize, result: &MapResult) -> String {
         let mut lines = Vec::new();
-        for aln in &result.alignments {
+        for aln in &result.mappings {
             let strand = if aln.strand == Strand::Forward { '+' } else { '-' };
             let mut line = format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -218,14 +335,33 @@ impl Aligner {
         lines.join("\n")
     }
 
-    /// Access the underlying index (for advanced use).
+    // --- Index management ---
+
+    /// Save the index to a file (RMMI format).
+    pub fn save_index(&self, path: &str) -> io::Result<()> {
+        self.index.save(path).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+
+    /// Access the underlying index.
     pub fn index(&self) -> &Index { &self.index }
 
-    /// Access the current MapOptions (for advanced use).
+    /// Access the current MapOptions.
     pub fn options(&self) -> &MapOptions { &self.options }
 
     /// Mutably access MapOptions for fine-tuning after construction.
     pub fn options_mut(&mut self) -> &mut MapOptions { &mut self.options }
+
+    /// Mutably access OutputConfig for toggling CIGAR/CS/MD/SAM defaults.
+    pub fn output_config_mut(&mut self) -> &mut OutputConfig { &mut self.out_cfg }
+
+    // --- Internal ---
+
+    fn resolve_out_cfg(&self, opts: &MapOpts) -> OutputConfig {
+        let mut out = self.out_cfg.clone();
+        if let Some(cs) = opts.cs { out.do_cs = cs; }
+        if let Some(md) = opts.md { out.do_md = md; }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -257,9 +393,23 @@ fn to_map_result(
     mi: &Index,
     out: &OutputConfig,
 ) -> MapResult {
-    let alignments = pq.results.iter().zip(pq.mapqs.iter()).map(|(r, &mapq)| {
-        Alignment {
-            target_name: mi.seqs[r.ref_id].name.clone(),
+    // Cache Arc<str> per target to avoid cloning the name for each alignment
+    let mut name_cache: Vec<Option<Arc<str>>> = vec![None; mi.seqs.len()];
+
+    let mappings = pq.results.iter().zip(pq.mapqs.iter()).map(|(r, &mapq)| {
+        let cigar_str = if out.do_cigar && !r.cigar_str.is_empty() { Some(r.cigar_str.clone()) } else { None };
+        let cigar_ops = cigar_str.as_ref().map(|s| parse_cigar_string(s));
+        let trans_strand = match r.trans_strand {
+            1 => Some(Strand::Forward),
+            2 => Some(Strand::Reverse),
+            _ => None,
+        };
+        let target_name = name_cache[r.ref_id].get_or_insert_with(|| {
+            Arc::from(mi.seqs[r.ref_id].name.as_str())
+        }).clone();
+        Mapping {
+            target_name,
+            target_id: r.ref_id,
             target_len: mi.seqs[r.ref_id].len,
             target_start: r.ref_start,
             target_end: r.ref_end,
@@ -268,26 +418,50 @@ fn to_map_result(
             strand: if r.is_reverse { Strand::Reverse } else { Strand::Forward },
             mapq,
             is_primary: !r.is_secondary,
+            is_supplementary: r.split != 0,
+            is_spliced: r.is_spliced,
+            trans_strand,
             matches: r.matches,
             block_len: r.block_len,
             edit_distance: r.edit_distance,
-            cigar: if out.do_cigar && !r.cigar_str.is_empty() { Some(r.cigar_str.clone()) } else { None },
+            cigar: cigar_str,
+            cigar_ops,
             cs: if out.do_cs && !r.cs_str.is_empty() { Some(r.cs_str.clone()) } else { None },
+            md: if out.do_md && !r.md_str.is_empty() { Some(r.md_str.clone()) } else { None },
             score: r.align_score,
             divergence: r.divergence,
         }
     }).collect();
-    MapResult { alignments }
+    MapResult { mappings }
+}
+
+/// Parse a CIGAR string like "10M2I5M3D8M" into structured CigarOps.
+fn parse_cigar_string(s: &str) -> Vec<CigarOp> {
+    let mut ops = Vec::new();
+    let mut num = 0u32;
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            num = num * 10 + (c as u32 - '0' as u32);
+        } else {
+            let op = match c {
+                'M' => 0, 'I' => 1, 'D' => 2, 'N' => 3, 'S' => 4, 'H' => 5, '=' => 7, 'X' => 8,
+                _ => continue,
+            };
+            if num > 0 { ops.push(CigarOp { len: num, op }); }
+            num = 0;
+        }
+    }
+    ops
 }
 
 /// Parse PAF-formatted output back into a MapResult (for paired-end path).
 fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
-    let mut alignments = Vec::new();
+    let mut mappings = Vec::new();
     for line in paf.lines() {
         if line.is_empty() { continue; }
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() < 12 { continue; }
-        let target_name = fields[5].to_string();
+        let target_name: Arc<str> = Arc::from(fields[5]);
         let target_len = fields[6].parse().unwrap_or(0);
         let target_start: usize = fields[7].parse().unwrap_or(0);
         let target_end: usize = fields[8].parse().unwrap_or(0);
@@ -314,14 +488,28 @@ fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
             else if tag.starts_with("tp:A:S") || tag.starts_with("tp:A:s") { is_secondary = true; }
         }
 
-        alignments.push(Alignment {
-            target_name, target_len, target_start, target_end,
+        let cigar_ops = cigar.as_ref().map(|s| parse_cigar_string(s));
+        let is_spliced = cigar_ops.as_ref().map_or(false, |ops| ops.iter().any(|op| op.op == 3));
+
+        // Extract md tag
+        let mut md = None;
+        for &tag in &fields[12..] {
+            if let Some(val) = tag.strip_prefix("MD:Z:") { md = Some(val.to_string()); }
+        }
+
+        // Find target_id by name
+        let target_id = _mi.seqs.iter().position(|s| s.name.as_str() == &*target_name).unwrap_or(0);
+
+        mappings.push(Mapping {
+            target_name, target_id, target_len, target_start, target_end,
             query_start, query_end, strand, mapq,
-            is_primary: !is_secondary, matches, block_len,
-            edit_distance, cigar, cs, score, divergence,
+            is_primary: !is_secondary, is_supplementary: false,
+            is_spliced, trans_strand: None,
+            matches, block_len,
+            edit_distance, cigar, cigar_ops, cs, md, score, divergence,
         });
     }
-    MapResult { alignments }
+    MapResult { mappings }
 }
 
 // ---------------------------------------------------------------------------
@@ -814,8 +1002,8 @@ mod tests {
 
     #[test]
     fn test_map_result_empty() {
-        let result = MapResult { alignments: Vec::new() };
-        assert!(result.alignments.is_empty());
+        let result = MapResult { mappings: Vec::new() };
+        assert!(result.mappings.is_empty());
     }
 
     #[test]

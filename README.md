@@ -31,7 +31,8 @@ cargo build --release
 
 ## Library API
 
-rammap can be used as a Rust library for programmatic alignment.
+rammap can be used as a Rust library for programmatic alignment, with an API
+compatible with [minimap2-rs](https://github.com/jguhlin/minimap2-rs).
 
 ### Add to your project
 
@@ -49,20 +50,31 @@ fn main() -> std::io::Result<()> {
     // Load a reference (from FASTA or pre-built .mmi index)
     let aligner = Aligner::from_fasta("reference.fa", Preset::MapOnt)?;
 
+    // Or use builder-style preset methods:
+    // let aligner = Aligner::from_fasta("reference.fa", Aligner::map_ont())?;
+
     // Align a read
     let result = aligner.map_seq("read1", b"ACGTACGTACGT...");
 
-    for aln in &result.alignments {
-        let strand = match aln.strand {
+    for m in &result.mappings {
+        let strand = match m.strand {
             Strand::Forward => "+",
             Strand::Reverse => "-",
         };
         println!("{} {}:{}-{} strand={} mapq={} score={}",
-            aln.target_name, aln.target_start, aln.target_end,
-            strand, aln.mapq, aln.score);
+            m.target_name, m.target_start, m.target_end,
+            strand, m.mapq, m.score);
 
-        if let Some(ref cigar) = aln.cigar {
+        if let Some(ref cigar) = m.cigar {
             println!("  CIGAR: {}", cigar);
+        }
+
+        // Structured CIGAR also available:
+        if let Some(ref ops) = m.cigar_ops {
+            for op in ops {
+                print!("{}{}", op.len, op.op_char());
+            }
+            println!();
         }
     }
     Ok(())
@@ -80,37 +92,63 @@ let aligner = Aligner::from_index("reference.mmi", Preset::Sr)?;
 // Build index from FASTA (slower, builds in memory)
 let aligner = Aligner::from_fasta("reference.fa", Preset::MapOnt)?;
 
+// Build index from in-memory sequences
+let seqs = vec![("chr1".to_string(), b"ACGT...".to_vec())];
+let aligner = Aligner::from_seqs(seqs, Preset::MapOnt);
+
+// Builder-style preset methods (minimap2-rs compatible)
+let aligner = Aligner::from_fasta("ref.fa", Aligner::map_ont())?;
+let aligner = Aligner::from_fasta("ref.fa", Aligner::splice())?;
+
 // Align single-end read
 let result = aligner.map_seq("read_name", sequence_bytes);
 
 // Align paired-end reads
 let result = aligner.map_pair("read_name", seq_r1, seq_r2);
 
+// Per-call CS/MD tag toggle
+use rammap::MapOpts;
+let result = aligner.map_seq_with("read1", seq, MapOpts { cs: Some(true), md: Some(true) });
+assert!(result.mappings[0].cs.is_some());
+
+// Save index for reuse
+aligner.save_index("output.rmmi")?;
+
 // Fine-tune parameters after construction
 aligner.options_mut().chaining.max_gap = 10000;
 aligner.options_mut().filtering.best_n = 50;
+
+// Toggle output options
+aligner.output_config_mut().eqx = true;  // =/X CIGAR
 ```
 
-#### `MapResult` / `Alignment`
+#### `MapResult` / `Mapping`
 
 ```rust
 let result = aligner.map_seq("read1", seq);
 
-for aln in &result.alignments {
-    aln.target_name     // "chr1", "chr20", etc.
-    aln.target_start    // 0-based start on reference
-    aln.target_end      // exclusive end on reference
-    aln.query_start     // 0-based start on query
-    aln.query_end       // exclusive end on query
-    aln.strand          // Strand::Forward or Strand::Reverse
-    aln.mapq            // mapping quality (0-60)
-    aln.is_primary      // true for primary alignment
-    aln.matches         // number of matching bases
-    aln.block_len       // alignment block length
-    aln.edit_distance   // NM tag value
-    aln.cigar           // Option<String> — CIGAR string
-    aln.score           // alignment score (AS tag)
-    aln.divergence      // sequence divergence (0.0 = identical)
+for m in &result.mappings {
+    m.target_name       // Arc<str> — "chr1", "chr20", etc. (shared across mappings)
+    m.target_id         // numeric index into reference
+    m.target_start      // 0-based start on reference
+    m.target_end        // exclusive end on reference
+    m.query_start       // 0-based start on query
+    m.query_end         // exclusive end on query
+    m.strand            // Strand::Forward or Strand::Reverse
+    m.mapq              // mapping quality (0-60)
+    m.is_primary        // true for primary alignment
+    m.is_supplementary  // true for supplementary alignment
+    m.is_spliced        // true if contains intron (N_SKIP) operations
+    m.trans_strand      // transcript strand for splice alignments
+    m.matches           // number of matching bases
+    m.block_len         // alignment block length
+    m.edit_distance     // NM tag value
+    m.cigar             // Option<String> — CIGAR string
+    m.cigar_ops         // Option<Vec<CigarOp>> — structured CIGAR
+    m.cs                // Option<String> — CS tag (if requested)
+    m.md                // Option<String> — MD tag (if requested)
+    m.score             // alignment score (AS tag)
+    m.divergence        // sequence divergence (0.0 = identical)
 }
 ```
 
@@ -164,17 +202,7 @@ let scoring = DpScoring {
 let result = dp_align(&query, &target, &scoring, -1);
 ```
 
-The DP engine automatically selects the best SIMD backend (AVX512 > AVX2 > SSE2 > scalar).
-
-### Running the Examples
-
-```bash
-# Map reads against a reference
-cargo run --release --example simple_align -- reference.fa reads.fq
-
-# Pairwise DP alignment
-cargo run --release --example dp_align
-```
+The DP engine automatically selects the best SIMD backend (AVX512 > AVX2 > SSE4.1 > SSE2 > NEON > WASM > scalar).
 
 ## Building
 
@@ -207,7 +235,7 @@ See [`docs/performance.md`](docs/performance.md) for detailed benchmarks against
 
 ## WASM
 
-See [`docs/wasm.md`](docs/wasm.md) for WASM implementation, web and WASI examples.
+See [`docs/wasm.md`](docs/wasm.md) for WASM build instructions, web demo, and benchmarks.
 
 ## License
 
