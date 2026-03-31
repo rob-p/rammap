@@ -17,10 +17,18 @@ self.onmessage = async function(e) {
   if (type === 'init') {
     try {
       // Import and initialize the WASM module
-      const { default: init, align_wasm_full } = await import('../pkg/rammap.js');
-      await init();
-      wasm = { align_wasm_full };
-      postMessage({ type: 'ready' });
+      const mod = await import('../pkg/rammap.js');
+      await mod.default();
+
+      // Initialize rayon thread pool if available (threaded build)
+      let threads = 1;
+      if (mod.initThreadPool) {
+        threads = data?.numThreads || navigator.hardwareConcurrency || 4;
+        await mod.initThreadPool(threads);
+      }
+
+      wasm = { align_wasm_full: mod.align_wasm_full };
+      postMessage({ type: 'ready', threads });
     } catch (err) {
       postMessage({ type: 'error', text: `Failed to load WASM: ${err.message || err}` });
     }

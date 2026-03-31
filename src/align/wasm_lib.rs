@@ -5,6 +5,11 @@ use crate::align::index::Index;
 use crate::align::pipeline::{align_and_format_query, OutputConfig, ReadInfo};
 use crate::align::extend::AlignmentContext;
 
+/// Re-export rayon thread pool initializer for WASM multithreading.
+/// JS must call `await initThreadPool(n)` before any parallel work.
+#[cfg(feature = "wasm-threads")]
+pub use wasm_bindgen_rayon::init_thread_pool;
+
 #[wasm_bindgen]
 extern "C" {
     /// Log callback — sends progress messages to the JS host.
@@ -169,28 +174,52 @@ pub fn align_wasm_full(
         rg_id: None,
         split_mode: false,
     };
-    let mut ctx = AlignmentContext::new();
-    let mut map_ctx = MapContext::new();
     let mut n_aligned = 0usize;
 
-    for (qname, qseq) in &query_seqs {
-        let ri = ReadInfo {
-            qname,
-            qseq: qseq.as_bytes(),
-            qual: None,
-            comment: None,
-            n_seg: 1,
-            seg_idx: 0,
-        };
-        let res = align_and_format_query(
-            &opt, &idx, &ri,
-            &mut ctx, &mut map_ctx,
-            None, None,
-            &out_cfg,
-        );
-        if !res.0.is_empty() {
-            output_buf.push_str(&res.0);
-            n_aligned += 1;
+    #[cfg(feature = "wasm-threads")]
+    {
+        use rayon::prelude::*;
+        emit_log!("[*] Using parallel alignment ({} threads)", rayon::current_num_threads());
+
+        let results: Vec<String> = query_seqs.par_iter().map_init(
+            || (AlignmentContext::new(), MapContext::new()),
+            |(ctx, map_ctx), (qname, qseq)| {
+                let ri = ReadInfo {
+                    qname, qseq: qseq.as_bytes(),
+                    qual: None, comment: None, n_seg: 1, seg_idx: 0,
+                };
+                let res = align_and_format_query(
+                    &opt, &idx, &ri, ctx, map_ctx, None, None, &out_cfg,
+                );
+                res.0
+            },
+        ).collect();
+
+        for res in results {
+            if !res.is_empty() {
+                output_buf.push_str(&res);
+                n_aligned += 1;
+            }
+        }
+    }
+
+    #[cfg(not(feature = "wasm-threads"))]
+    {
+        let mut ctx = AlignmentContext::new();
+        let mut map_ctx = MapContext::new();
+
+        for (qname, qseq) in &query_seqs {
+            let ri = ReadInfo {
+                qname, qseq: qseq.as_bytes(),
+                qual: None, comment: None, n_seg: 1, seg_idx: 0,
+            };
+            let res = align_and_format_query(
+                &opt, &idx, &ri, &mut ctx, &mut map_ctx, None, None, &out_cfg,
+            );
+            if !res.0.is_empty() {
+                output_buf.push_str(&res.0);
+                n_aligned += 1;
+            }
         }
     }
 

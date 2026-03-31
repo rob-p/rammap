@@ -78,8 +78,7 @@ table.results td {
 table.results tr:hover td { background: #f5f5f5; }
 table.results td.num { text-align: right; font-variant-numeric: tabular-nums; }
 table.results td.cigar {
-  max-width: 300px; font-size: 10px; color: #666;
-  cursor: pointer;
+  max-width: 300px; font-size: 10px; color: #666; cursor: pointer;
 }
 table.results td.cigar:hover { color: #111; overflow: visible; white-space: normal; word-break: break-all; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
@@ -126,6 +125,10 @@ table.results td.cigar:hover { color: #111; overflow: visible; white-space: norm
       <option value="sam">SAM</option>
     </select>
   </div>
+  <div>
+    <label>Threads</label>
+    <select id="threads"></select>
+  </div>
   <div class="check">
     <input type="checkbox" id="cigar" checked>
     <label for="cigar" style="margin:0;text-transform:none;font-weight:normal">CIGAR</label>
@@ -157,7 +160,7 @@ table.results td.cigar:hover { color: #111; overflow: visible; white-space: norm
 <script type="module">
 let refText = null;
 let queryText = null;
-let workerReady = false;
+let wasmReady = false;
 let running = false;
 let currentTab = 'raw';
 let lastOutput = '';
@@ -166,6 +169,23 @@ let lastFormat = 'paf';
 const logPanel = document.getElementById('log-panel');
 const rawPanel = document.getElementById('output-raw');
 const tablePanel = document.getElementById('output-table');
+const statusEl = document.getElementById('status');
+const runBtn = document.getElementById('run-btn');
+
+function log(msg) {
+  logPanel.textContent += msg + '\n';
+  logPanel.scrollTop = logPanel.scrollHeight;
+}
+
+function updateRunBtn() {
+  runBtn.disabled = !(wasmReady && refText && queryText && !running);
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+}
 
 window.setTab = function(tab) {
   currentTab = tab;
@@ -176,41 +196,31 @@ window.setTab = function(tab) {
   if (tab === 'table' && lastOutput) renderTable(lastOutput, lastFormat);
 };
 
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
 function renderTable(text, format) {
   if (!text.trim()) { tablePanel.innerHTML = '<em>(no alignments)</em>'; return; }
   const lines = text.trim().split('\n').filter(l => l && !l.startsWith('@'));
   if (lines.length === 0) { tablePanel.innerHTML = '<em>(no alignments)</em>'; return; }
-
-  if (format === 'sam') {
-    renderSamTable(lines);
-  } else {
-    renderPafTable(lines);
-  }
+  if (format === 'sam') { renderSamTable(lines); } else { renderPafTable(lines); }
 }
 
 function renderPafTable(lines) {
   const cols = [
-    { key: 0, label: 'Query', cls: '' },
-    { key: 1, label: 'QLen', cls: 'num' },
-    { key: 2, label: 'QStart', cls: 'num' },
-    { key: 3, label: 'QEnd', cls: 'num' },
-    { key: 4, label: 'Strand', cls: '' },
-    { key: 5, label: 'Target', cls: '' },
-    { key: 6, label: 'TLen', cls: 'num' },
-    { key: 7, label: 'TStart', cls: 'num' },
-    { key: 8, label: 'TEnd', cls: 'num' },
-    { key: 9, label: 'Matches', cls: 'num' },
-    { key: 10, label: 'Block', cls: 'num' },
-    { key: 11, label: 'MAPQ', cls: 'num' },
+    { key: 0, label: 'Query' }, { key: 1, label: 'QLen', cls: 'num' },
+    { key: 2, label: 'QStart', cls: 'num' }, { key: 3, label: 'QEnd', cls: 'num' },
+    { key: 4, label: 'Strand' }, { key: 5, label: 'Target' },
+    { key: 6, label: 'TLen', cls: 'num' }, { key: 7, label: 'TStart', cls: 'num' },
+    { key: 8, label: 'TEnd', cls: 'num' }, { key: 9, label: 'Matches', cls: 'num' },
+    { key: 10, label: 'Block', cls: 'num' }, { key: 11, label: 'MAPQ', cls: 'num' },
   ];
-  // Tags we care about
   const tagCols = ['NM', 'AS', 'ms', 'tp', 'cm', 'de', 'cg'];
-
   let html = '<table class="results"><thead><tr>';
   for (const c of cols) html += `<th>${c.label}</th>`;
   for (const t of tagCols) html += `<th>${t}</th>`;
   html += '</tr></thead><tbody>';
-
   for (const line of lines) {
     const f = line.split('\t');
     if (f.length < 12) continue;
@@ -219,7 +229,6 @@ function renderPafTable(lines) {
       const cls = c.cls ? ` class="${c.cls}"` : '';
       html += `<td${cls}>${esc(f[c.key] || '')}</td>`;
     }
-    // Parse tags from fields 12+
     const tags = {};
     for (let i = 12; i < f.length; i++) {
       const m = f[i].match(/^(\w+):\w:(.*)$/);
@@ -243,21 +252,16 @@ function renderPafTable(lines) {
 
 function renderSamTable(lines) {
   const cols = [
-    { key: 0, label: 'QName', cls: '' },
-    { key: 1, label: 'Flag', cls: 'num' },
-    { key: 2, label: 'RName', cls: '' },
-    { key: 3, label: 'Pos', cls: 'num' },
-    { key: 4, label: 'MAPQ', cls: 'num' },
-    { key: 5, label: 'CIGAR', cls: 'cigar' },
+    { key: 0, label: 'QName' }, { key: 1, label: 'Flag', cls: 'num' },
+    { key: 2, label: 'RName' }, { key: 3, label: 'Pos', cls: 'num' },
+    { key: 4, label: 'MAPQ', cls: 'num' }, { key: 5, label: 'CIGAR', cls: 'cigar' },
     { key: 8, label: 'TLen', cls: 'num' },
   ];
   const tagCols = ['NM', 'AS', 'ms', 'tp', 'de'];
-
   let html = '<table class="results"><thead><tr>';
   for (const c of cols) html += `<th>${c.label}</th>`;
   for (const t of tagCols) html += `<th>${t}</th>`;
   html += '</tr></thead><tbody>';
-
   for (const line of lines) {
     const f = line.split('\t');
     if (f.length < 11) continue;
@@ -267,9 +271,7 @@ function renderSamTable(lines) {
       let val = f[c.key] || '';
       if (c.cls === 'cigar' && val.length > 40) {
         html += `<td class="cigar" title="${esc(val)}">${esc(val)}</td>`;
-      } else {
-        html += `<td${cls}>${esc(val)}</td>`;
-      }
+      } else { html += `<td${cls}>${esc(val)}</td>`; }
     }
     const tags = {};
     for (let i = 11; i < f.length; i++) {
@@ -287,37 +289,15 @@ function renderSamTable(lines) {
   tablePanel.innerHTML = html;
 }
 
-function esc(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-const statusEl = document.getElementById('status');
-const runBtn = document.getElementById('run-btn');
-
-function log(msg) {
-  logPanel.textContent += msg + '\n';
-  logPanel.scrollTop = logPanel.scrollHeight;
-}
-
-function updateRunBtn() {
-  runBtn.disabled = !(workerReady && refText && queryText && !running);
-}
-
-function formatSize(bytes) {
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  return (bytes / 1024 / 1024).toFixed(1) + ' MB';
-}
-
+// --- Drop zones ---
 function setupDropZone(zoneId, fileId, onLoad) {
   const zone = document.getElementById(zoneId);
   const input = document.getElementById(fileId);
-
   zone.addEventListener('click', () => input.click());
   zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
   zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
   zone.addEventListener('drop', e => {
-    e.preventDefault();
-    zone.classList.remove('dragover');
+    e.preventDefault(); zone.classList.remove('dragover');
     if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0], zone, onLoad);
   });
   input.addEventListener('change', () => {
@@ -330,42 +310,48 @@ function handleFile(file, zone, onLoad) {
   zone.innerHTML = `<span class="filename">${file.name}</span><span class="filesize">${formatSize(file.size)}</span>`;
   log(`[*] Loading ${file.name} (${formatSize(file.size)})...`);
   const reader = new FileReader();
-  reader.onload = () => {
-    onLoad(reader.result);
-    log(`[*] ${file.name} loaded`);
-    updateRunBtn();
-  };
+  reader.onload = () => { onLoad(reader.result); log(`[*] ${file.name} loaded`); updateRunBtn(); };
   reader.readAsText(file);
 }
 
 setupDropZone('ref-drop', 'ref-file', text => { refText = text; });
 setupDropZone('query-drop', 'query-file', text => { queryText = text; });
 
-// --- Web Worker for background alignment ---
-const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+// --- Web Worker (runs in pkg/ so wasm-bindgen-rayon paths resolve) ---
+let worker = null;
 
-worker.onmessage = function(e) {
-  const { type, text, output, log: wasmLog } = e.data;
+function createWorker(numThreads) {
+  if (worker) worker.terminate();
+  wasmReady = false;
+  updateRunBtn();
+
+  worker = new Worker('../pkg/worker.js', { type: 'module' });
+  worker.onmessage = onWorkerMessage;
+  worker.postMessage({ type: 'init', data: { numThreads } });
+}
+
+function onWorkerMessage(e) {
+  const { type } = e.data;
 
   if (type === 'ready') {
-    workerReady = true;
-    log('[*] WASM ready (SIMD128, background worker)');
+    wasmReady = true;
+    const threads = e.data.threads || 1;
+    log(`[*] WASM ready (SIMD128, ${threads} thread${threads > 1 ? 's' : ''})`);
     updateRunBtn();
   }
 
   if (type === 'log') {
-    // Real-time log messages from WASM console.log override
-    log(text);
+    log(e.data.text);
   }
 
   if (type === 'result') {
     running = false;
     runBtn.classList.remove('running');
-    const elapsed = ((performance.now() - window._alignStart) / 1000).toFixed(3);
-    if (wasmLog) log(wasmLog.trim());
+    const elapsed = ((performance.now() - window._t0) / 1000).toFixed(3);
+    if (e.data.log) log(e.data.log.trim());
     log(`[*] Total wall time: ${elapsed}s`);
 
-    lastOutput = output || '';
+    lastOutput = e.data.output || '';
     lastFormat = document.getElementById('format').value === 'sam' ? 'sam' : 'paf';
     rawPanel.textContent = lastOutput || '(no alignments)';
     if (currentTab === 'table') renderTable(lastOutput, lastFormat);
@@ -378,16 +364,13 @@ worker.onmessage = function(e) {
   if (type === 'error') {
     running = false;
     runBtn.classList.remove('running');
-    log(`[ERROR] ${text}`);
+    log(`[ERROR] ${e.data.text}`);
     statusEl.textContent = 'Error';
     updateRunBtn();
   }
 };
 
-// Initialize the worker
-log('[*] Loading WASM module in background worker...');
-worker.postMessage({ type: 'init' });
-
+// --- Align ---
 runBtn.addEventListener('click', () => {
   if (!refText || !queryText || running) return;
 
@@ -398,20 +381,43 @@ runBtn.addEventListener('click', () => {
   tablePanel.innerHTML = '';
   logPanel.textContent = '';
   lastOutput = '';
-  statusEl.textContent = 'Aligning...';
 
   const preset = document.getElementById('preset').value;
   const outputSam = document.getElementById('format').value === 'sam';
   const cigar = document.getElementById('cigar').checked;
 
   log(`[*] Starting alignment: preset=${preset}, format=${outputSam ? 'SAM' : 'PAF'}, cigar=${cigar}`);
+  statusEl.textContent = 'Aligning...';
 
-  window._alignStart = performance.now();
+  window._t0 = performance.now();
   worker.postMessage({
     type: 'align',
     data: { refText, queryText, preset, outputSam, outputCigar: cigar }
   });
 });
+
+// --- Thread selector ---
+const threadSelect = document.getElementById('threads');
+const maxThreads = navigator.hardwareConcurrency || 8;
+const defaultThreads = Math.min(4, maxThreads);
+for (let i = 1; i <= maxThreads; i++) {
+  const opt = document.createElement('option');
+  opt.value = i;
+  opt.textContent = i === 1 ? '1 (single)' : `${i}`;
+  if (i === defaultThreads) opt.selected = true;
+  threadSelect.appendChild(opt);
+}
+
+threadSelect.addEventListener('change', () => {
+  if (running) return;
+  const n = parseInt(threadSelect.value);
+  log(`[*] Reinitializing with ${n} thread${n > 1 ? 's' : ''}...`);
+  createWorker(n);
+});
+
+// --- Initialize WASM in worker ---
+log(`[*] Loading WASM module... (${maxThreads} logical cores available)`);
+createWorker(defaultThreads);
 </script>
 
 </body>

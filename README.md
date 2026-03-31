@@ -205,6 +205,10 @@ modular components (seeding, chaining, alignment, etc).
 
 See [`docs/performance.md`](docs/performance.md) for detailed benchmarks against minimap2.
 
+## WASM
+
+See [`docs/wasm.md`](docs/wasm.md) for WASM implementation, web and WASI examples.
+
 ## License
 
 MIT
