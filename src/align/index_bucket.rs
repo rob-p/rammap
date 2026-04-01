@@ -13,18 +13,18 @@ use serde::{Serialize, Deserialize};
 use super::index::SeedLookup;
 
 /// Sentinel for empty hash table slots.
-const EMPTY_KEY: u32 = u32::MAX;
+const EMPTY_KEY: u64 = u64::MAX;
 
 /// A single bucket's hash table. Open-addressing with linear probing.
-/// Keys are u32 hash suffixes (hash >> bucket_bits, truncated to 32 bits).
+/// Keys are u64 hash suffixes (hash >> bucket_bits). Must be u64 to avoid
+/// truncation for large k (k=25 produces 50-bit hashes; after removing
+/// bucket_bits the suffix can exceed 32 bits).
 /// Values are packed (offset: u32, count: u32) as a single u64.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Bucket {
-    /// Interleaved [key0(u32), pad(u32), val(u64), key1(u32), pad(u32), val(u64), ...]
-    /// Using separate key/val arrays for better cache behavior on lookup.
-    keys: Vec<u32>,
+    keys: Vec<u64>,
     vals: Vec<u64>,
-    mask: u32, // capacity - 1
+    mask: u64, // capacity - 1
 }
 
 impl Bucket {
@@ -37,11 +37,11 @@ impl Bucket {
         let cap = ((n * 4 / 3) + 1).next_power_of_two().max(4);
         let keys = vec![EMPTY_KEY; cap];
         let vals = vec![0u64; cap];
-        Self { keys, vals, mask: (cap - 1) as u32 }
+        Self { keys, vals, mask: (cap - 1) as u64 }
     }
 
     #[inline]
-    fn insert(&mut self, key: u32, value: u64) {
+    fn insert(&mut self, key: u64, value: u64) {
         let mut idx = key & self.mask;
         loop {
             let i = idx as usize;
@@ -55,7 +55,7 @@ impl Bucket {
     }
 
     #[inline]
-    fn get(&self, key: u32) -> Option<u64> {
+    fn get(&self, key: u64) -> Option<u64> {
         if self.mask == 0 { return None; }
         let mut idx = key & self.mask;
         loop {
@@ -68,7 +68,7 @@ impl Bucket {
     }
 
     /// Iterate over all occupied (key, value) pairs.
-    fn iter(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+    fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.keys.iter().copied().zip(self.vals.iter().copied())
             .filter(|(k, _)| *k != EMPTY_KEY)
     }
@@ -113,7 +113,7 @@ impl BucketHashLookup {
             for &(key, value) in hash_entries {
                 // minimap2 key: (hash_suffix << 1) | singleton_flag
                 // Our key: hash_suffix (key >> 1), stored as u32
-                let our_key = (key >> 1) as u32;
+                let our_key = key >> 1;
 
                 if key & 1 != 0 {
                     // Singleton: value is the position directly
@@ -178,7 +178,7 @@ impl BucketHashLookup {
                 let count = i - start;
                 if max_occ < usize::MAX && count > max_occ { continue; }
 
-                let key = (h >> bucket_bits) as u32;
+                let key = h >> bucket_bits;
                 let offset = local_pos.len() as u32;
                 for it in b.iter().take(i).skip(start) {
                     local_pos.push(it.1);
@@ -239,7 +239,7 @@ impl BucketHashLookup {
         if bi < self.buckets.len() {
             let bucket = &self.buckets[bi];
             if bucket.mask > 0 {
-                let key = (hash >> self.bucket_bits) as u32;
+                let key = hash >> self.bucket_bits;
                 let idx = (key & bucket.mask) as usize;
                 // Prefetch the keys and vals arrays at the expected probe position
                 unsafe {
@@ -284,7 +284,7 @@ impl SeedLookup for BucketHashLookup {
     fn get(&self, hash: u64) -> Option<&[u64]> {
         let mask = (1u64 << self.bucket_bits) - 1;
         let bucket = &self.buckets[(hash & mask) as usize];
-        let key = (hash >> self.bucket_bits) as u32;
+        let key = hash >> self.bucket_bits;
         let encoded = bucket.get(key)?;
         let offset = (encoded >> 32) as usize;
         let count = (encoded & 0xFFFFFFFF) as usize;
@@ -295,7 +295,7 @@ impl SeedLookup for BucketHashLookup {
     fn get_range(&self, hash: u64) -> Option<(u32, u32)> {
         let mask = (1u64 << self.bucket_bits) - 1;
         let bucket = &self.buckets[(hash & mask) as usize];
-        let key = (hash >> self.bucket_bits) as u32;
+        let key = hash >> self.bucket_bits;
         let encoded = bucket.get(key)?;
         let offset = (encoded >> 32) as u32;
         let count = (encoded & 0xFFFFFFFF) as u32;
