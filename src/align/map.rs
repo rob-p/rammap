@@ -992,8 +992,38 @@ pub fn map_query_multi(
     stats.t_chain = t2.elapsed();
     stats.n_chains = chains.len();
 
-    // Re-chaining: check n_chained_segs < n_segs (map.c:293-316)
-    if opt.seeding.max_occ > opt.seeding.mid_occ && rep_len > 0 && !opt.flags.contains(AlignFlags::RMQ_CHAIN) {
+    // RMQ rescue re-chaining (map.c:283-291) — checked FIRST, before high-occ re-chain
+    let skip_rescue = opt.flags.intersects(AlignFlags::SPLICE | AlignFlags::SHORT_READ | AlignFlags::NO_LJOIN);
+    if n_segs == 1 && opt.chaining.bandwidth_long > opt.chaining.bandwidth && u.len() > 1 && !skip_rescue {
+        let first_chain_cnt = (u[0] & 0xFFFFFFFF) as usize;
+        if first_chain_cnt > 0 {
+            let first_anchor = &chains[0];
+            let last_anchor = &chains[first_chain_cnt - 1];
+            let st = first_anchor.query_pos();
+            let en = last_anchor.query_pos();
+            let coverage = (en - st) as usize;
+
+            let needs_rescue = (qlen_sum.saturating_sub(coverage) > opt.chaining.rmq_rescue_size as usize)
+                || (coverage > (qlen_sum as f32 * opt.chaining.rmq_rescue_ratio) as usize);
+
+            if needs_rescue {
+                PC_RESCUE_COUNT.fetch_add(1, Relaxed);
+                PC_RESCUE_ANCHORS.fetch_add(chains.len() as u64, Relaxed);
+
+                let n_a: usize = u.iter().map(|&v| (v & 0xFFFFFFFF) as usize).sum();
+                let mut rescue_anchors: Vec<Minimizer> = chains[..n_a].to_vec();
+                radix_sort_128x(&mut rescue_anchors);
+
+                let rescue_params = ChainingParams { bandwidth: opt.chaining.bandwidth_long, ..opt.chaining.clone() };
+                let (u2, chains2) = chain_anchors_rmq(
+                    &rescue_params, &mut rescue_anchors, &mut ctx.chain_bufs,
+                );
+
+                u = u2;
+                chains = chains2;
+            }
+        }
+    } else if opt.seeding.max_occ > opt.seeding.mid_occ && rep_len > 0 && !opt.flags.contains(AlignFlags::RMQ_CHAIN) {
         let rechain = if !u.is_empty() {
             // Find best chain by score, count distinct segment IDs
             let mut max_score = 0u64;
@@ -1318,19 +1348,18 @@ pub fn map_query(
             if needs_rescue {
                 PC_RESCUE_COUNT.fetch_add(1, Relaxed);
                 PC_RESCUE_ANCHORS.fetch_add(chains.len() as u64, Relaxed);
-                // Stable sort by x before re-chaining
-                radix_sort_128x(&mut chains);
 
-                // RMQ rescue uses bandwidth_long instead of bandwidth
+                let n_a: usize = u.iter().map(|&v| (v & 0xFFFFFFFF) as usize).sum();
+                let mut rescue_anchors: Vec<Minimizer> = chains[..n_a].to_vec();
+                radix_sort_128x(&mut rescue_anchors);
+
                 let rescue_params = ChainingParams { bandwidth: opt.chaining.bandwidth_long, ..opt.chaining.clone() };
                 let (u2, chains2) = chain_anchors_rmq(
-                    &rescue_params, &mut chains, &mut ctx.chain_bufs,
+                    &rescue_params, &mut rescue_anchors, &mut ctx.chain_bufs,
                 );
 
-                if !u2.is_empty() {
-                    u = u2;
-                    chains = chains2;
-                }
+                u = u2;
+                chains = chains2;
             }
         }
     } else if opt.seeding.max_occ > opt.seeding.mid_occ && rep_len > 0 && !opt.flags.contains(AlignFlags::RMQ_CHAIN) {

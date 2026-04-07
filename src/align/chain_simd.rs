@@ -320,93 +320,67 @@ pub(crate) unsafe fn chain_anchors_avx2(
             -1
         };
 
-        // Phase 1: SIMD batch score computation
-        if i > window_start {
-            compute_chain_scores_batch_avx2(
-                soa_query_pos[i],
-                soa_ref_pos[i],
-                soa_rid_strand[i],
-                &soa_ref_pos,
-                &soa_query_pos,
-                &soa_query_span,
-                &soa_rid_strand,
-                max_dist_x,
-                max_dist_y,
-                bw,
-                opt.chn_pen_gap,
-                opt.chn_pen_skip,
-                &mut soa_sc_buf,
-                window_start,
-                i,
-            );
-        }
-
         if no_chain_skip {
-            // Fast path: no skip heuristic — simple max scan over all predecessors
+            // No early termination — compute all scores, then scan
+            if i > window_start {
+                compute_chain_scores_batch_avx2(
+                    soa_query_pos[i], soa_ref_pos[i], soa_rid_strand[i],
+                    &soa_ref_pos, &soa_query_pos, &soa_query_span, &soa_rid_strand,
+                    max_dist_x, max_dist_y, bw,
+                    opt.chn_pen_gap, opt.chn_pen_skip,
+                    &mut soa_sc_buf, window_start, i,
+                );
+            }
             for j in window_start..i {
                 let sc = soa_sc_buf[j];
-                if sc == i32::MIN {
-                    continue;
-                }
+                if sc == i32::MIN { continue; }
                 let total_sc = sc + scores[j];
-                if total_sc > best_score {
-                    best_score = total_sc;
-                    best_predecessor = j as i64;
-                }
+                if total_sc > best_score { best_score = total_sc; best_predecessor = j as i64; }
             }
         } else {
-            // Phase 2: Scalar skip/visited logic over precomputed scores (bit-exact)
-            for j in (window_start..i).rev() {
-                let sc = soa_sc_buf[j];
-                if sc == i32::MIN {
-                    continue;
+            // Chunked reverse scan with early termination
+            const CHUNK_SIZE: usize = 64;
+            let mut chunk_end = i;
+            let mut skip_fired = false;
+            while chunk_end > window_start {
+                let chunk_start = if chunk_end >= window_start + CHUNK_SIZE { chunk_end - CHUNK_SIZE } else { window_start };
+
+                compute_chain_scores_batch_avx2(
+                    soa_query_pos[i], soa_ref_pos[i], soa_rid_strand[i],
+                    &soa_ref_pos, &soa_query_pos, &soa_query_span, &soa_rid_strand,
+                    max_dist_x, max_dist_y, bw,
+                    opt.chn_pen_gap, opt.chn_pen_skip,
+                    &mut soa_sc_buf, chunk_start, chunk_end,
+                );
+
+                for j in (chunk_start..chunk_end).rev() {
+                    let sc = soa_sc_buf[j];
+                    if sc == i32::MIN { continue; }
+                    let total_sc = sc + scores[j];
+                    if total_sc > best_score {
+                        best_score = total_sc; best_predecessor = j as i64;
+                        if skip_count > 0 { skip_count -= 1; }
+                    } else if visited[j] == i as i32 {
+                        skip_count += 1;
+                        if skip_count > opt.max_chain_skip { end_j = j as i64; skip_fired = true; break; }
+                    }
+                    if predecessors[j] >= 0 { visited[predecessors[j] as usize] = i as i32; }
                 }
 
-                let total_sc = sc + scores[j];
-                if total_sc > best_score {
-                    best_score = total_sc;
-                    best_predecessor = j as i64;
-                    if skip_count > 0 {
-                        skip_count -= 1;
-                    }
-                } else if visited[j] == i as i32 {
-                    skip_count += 1;
-                    if skip_count > opt.max_chain_skip {
-                        end_j = j as i64;
-                        break;
-                    }
-                }
-                if predecessors[j] >= 0 {
-                    visited[predecessors[j] as usize] = i as i32;
-                }
+                if skip_fired { break; }
+                chunk_end = chunk_start;
             }
 
-            // best_anchor_idx optimization (only needed with skip heuristic)
-            if best_anchor_idx < 0
-                || a[i].x - a[best_anchor_idx as usize].x > max_dist_x as u64
-            {
-                let mut best = i32::MIN;
-                best_anchor_idx = -1;
+            if best_anchor_idx < 0 || a[i].x - a[best_anchor_idx as usize].x > max_dist_x as u64 {
+                let mut best = i32::MIN; best_anchor_idx = -1;
                 for j in (window_start..i).rev() {
-                    if best < scores[j] {
-                        best = scores[j];
-                        best_anchor_idx = j as i64;
-                    }
+                    if best < scores[j] { best = scores[j]; best_anchor_idx = j as i64; }
                 }
             }
 
             if best_anchor_idx >= 0 && best_anchor_idx < end_j {
-                let sc = compute_chain_score(
-                    &a[i],
-                    &a[best_anchor_idx as usize],
-                    max_dist_x,
-                    max_dist_y,
-                    bw,
-                    opt.chn_pen_gap,
-                    opt.chn_pen_skip,
-                    false, // is_cdna = false in SIMD path
-                    1,     // n_seg = 1 in SIMD path
-                );
+                let sc = compute_chain_score(&a[i], &a[best_anchor_idx as usize],
+                    max_dist_x, max_dist_y, bw, opt.chn_pen_gap, opt.chn_pen_skip, false, 1);
                 if sc != i32::MIN && best_score < sc + scores[best_anchor_idx as usize] {
                     best_score = sc + scores[best_anchor_idx as usize];
                     best_predecessor = best_anchor_idx;
@@ -435,6 +409,7 @@ pub(crate) unsafe fn chain_anchors_avx2(
             global_max_score = best_score;
         }
     }
+
 
     // --- Backtrack and compact (identical to scalar) ---
     let (u, n_u, n_v) = chain_backtrack(
@@ -741,17 +716,17 @@ pub(crate) unsafe fn chain_anchors_sse(
 
         let mut end_j: i64 = if window_start > 0 { window_start as i64 - 1 } else { -1 };
 
-        if i > window_start {
-            compute_chain_scores_batch_sse(
-                soa_query_pos[i], soa_ref_pos[i], soa_rid_strand[i],
-                &soa_ref_pos, &soa_query_pos, &soa_query_span, &soa_rid_strand,
-                max_dist_x, max_dist_y, bw,
-                opt.chn_pen_gap, opt.chn_pen_skip,
-                &mut soa_sc_buf, window_start, i,
-            );
-        }
-
         if no_chain_skip {
+            // No early termination possible — compute all scores, then scan
+            if i > window_start {
+                compute_chain_scores_batch_sse(
+                    soa_query_pos[i], soa_ref_pos[i], soa_rid_strand[i],
+                    &soa_ref_pos, &soa_query_pos, &soa_query_span, &soa_rid_strand,
+                    max_dist_x, max_dist_y, bw,
+                    opt.chn_pen_gap, opt.chn_pen_skip,
+                    &mut soa_sc_buf, window_start, i,
+                );
+            }
             for j in window_start..i {
                 let sc = soa_sc_buf[j];
                 if sc == i32::MIN { continue; }
@@ -759,18 +734,48 @@ pub(crate) unsafe fn chain_anchors_sse(
                 if total_sc > best_score { best_score = total_sc; best_predecessor = j as i64; }
             }
         } else {
-            for j in (window_start..i).rev() {
-                let sc = soa_sc_buf[j];
-                if sc == i32::MIN { continue; }
-                let total_sc = sc + scores[j];
-                if total_sc > best_score {
-                    best_score = total_sc; best_predecessor = j as i64;
-                    if skip_count > 0 { skip_count -= 1; }
-                } else if visited[j] == i as i32 {
-                    skip_count += 1;
-                    if skip_count > opt.max_chain_skip { end_j = j as i64; break; }
+            // Chunked reverse scan: compute batch scores for each chunk, then
+            // scan with max_chain_skip early termination. Only compute the next
+            // chunk if skip hasn't fired — avoids wasting SIMD on predecessors
+            // that will never be examined.
+            const CHUNK_SIZE: usize = 64;
+            let mut chunk_end = i;
+            let mut skip_fired = false;
+            while chunk_end > window_start {
+                let chunk_start = if chunk_end >= window_start + CHUNK_SIZE {
+                    chunk_end - CHUNK_SIZE
+                } else {
+                    window_start
+                };
+
+                compute_chain_scores_batch_sse(
+                    soa_query_pos[i], soa_ref_pos[i], soa_rid_strand[i],
+                    &soa_ref_pos, &soa_query_pos, &soa_query_span, &soa_rid_strand,
+                    max_dist_x, max_dist_y, bw,
+                    opt.chn_pen_gap, opt.chn_pen_skip,
+                    &mut soa_sc_buf, chunk_start, chunk_end,
+                );
+
+                for j in (chunk_start..chunk_end).rev() {
+                    let sc = soa_sc_buf[j];
+                    if sc == i32::MIN { continue; }
+                    let total_sc = sc + scores[j];
+                    if total_sc > best_score {
+                        best_score = total_sc; best_predecessor = j as i64;
+                        if skip_count > 0 { skip_count -= 1; }
+                    } else if visited[j] == i as i32 {
+                        skip_count += 1;
+                        if skip_count > opt.max_chain_skip {
+                            end_j = j as i64;
+                            skip_fired = true;
+                            break;
+                        }
+                    }
+                    if predecessors[j] >= 0 { visited[predecessors[j] as usize] = i as i32; }
                 }
-                if predecessors[j] >= 0 { visited[predecessors[j] as usize] = i as i32; }
+
+                if skip_fired { break; }
+                chunk_end = chunk_start;
             }
 
             if best_anchor_idx < 0 || a[i].x - a[best_anchor_idx as usize].x > max_dist_x as u64 {
@@ -1062,58 +1067,65 @@ pub(crate) unsafe fn chain_anchors_avx512(
 
         let mut end_j: i64 = if window_start > 0 { window_start as i64 - 1 } else { -1 };
 
-        if i > window_start {
-            compute_chain_scores_batch_avx512(
-                soa_query_pos[i], soa_ref_pos[i], soa_rid_strand[i],
-                &soa_ref_pos, &soa_query_pos, &soa_query_span, &soa_rid_strand,
-                max_dist_x, max_dist_y, bw,
-                opt.chn_pen_gap, opt.chn_pen_skip,
-                &mut soa_sc_buf, window_start, i,
-            );
-        }
-
         if no_chain_skip {
+            if i > window_start {
+                compute_chain_scores_batch_avx512(
+                    soa_query_pos[i], soa_ref_pos[i], soa_rid_strand[i],
+                    &soa_ref_pos, &soa_query_pos, &soa_query_span, &soa_rid_strand,
+                    max_dist_x, max_dist_y, bw,
+                    opt.chn_pen_gap, opt.chn_pen_skip,
+                    &mut soa_sc_buf, window_start, i,
+                );
+            }
             for j in window_start..i {
                 let sc = soa_sc_buf[j];
                 if sc == i32::MIN { continue; }
                 let total_sc = sc + scores[j];
-                if total_sc > best_score {
-                    best_score = total_sc;
-                    best_predecessor = j as i64;
-                }
+                if total_sc > best_score { best_score = total_sc; best_predecessor = j as i64; }
             }
         } else {
-            for j in (window_start..i).rev() {
-                let sc = soa_sc_buf[j];
-                if sc == i32::MIN { continue; }
-                let total_sc = sc + scores[j];
-                if total_sc > best_score {
-                    best_score = total_sc;
-                    best_predecessor = j as i64;
-                    if skip_count > 0 { skip_count -= 1; }
-                } else if visited[j] == i as i32 {
-                    skip_count += 1;
-                    if skip_count > opt.max_chain_skip { end_j = j as i64; break; }
+            const CHUNK_SIZE: usize = 64;
+            let mut chunk_end = i;
+            let mut skip_fired = false;
+            while chunk_end > window_start {
+                let chunk_start = if chunk_end >= window_start + CHUNK_SIZE { chunk_end - CHUNK_SIZE } else { window_start };
+
+                compute_chain_scores_batch_avx512(
+                    soa_query_pos[i], soa_ref_pos[i], soa_rid_strand[i],
+                    &soa_ref_pos, &soa_query_pos, &soa_query_span, &soa_rid_strand,
+                    max_dist_x, max_dist_y, bw,
+                    opt.chn_pen_gap, opt.chn_pen_skip,
+                    &mut soa_sc_buf, chunk_start, chunk_end,
+                );
+
+                for j in (chunk_start..chunk_end).rev() {
+                    let sc = soa_sc_buf[j];
+                    if sc == i32::MIN { continue; }
+                    let total_sc = sc + scores[j];
+                    if total_sc > best_score {
+                        best_score = total_sc; best_predecessor = j as i64;
+                        if skip_count > 0 { skip_count -= 1; }
+                    } else if visited[j] == i as i32 {
+                        skip_count += 1;
+                        if skip_count > opt.max_chain_skip { end_j = j as i64; skip_fired = true; break; }
+                    }
+                    if predecessors[j] >= 0 { visited[predecessors[j] as usize] = i as i32; }
                 }
-                if predecessors[j] >= 0 { visited[predecessors[j] as usize] = i as i32; }
+
+                if skip_fired { break; }
+                chunk_end = chunk_start;
             }
 
-            if best_anchor_idx < 0
-                || a[i].x - a[best_anchor_idx as usize].x > max_dist_x as u64
-            {
-                let mut best = i32::MIN;
-                best_anchor_idx = -1;
+            if best_anchor_idx < 0 || a[i].x - a[best_anchor_idx as usize].x > max_dist_x as u64 {
+                let mut best = i32::MIN; best_anchor_idx = -1;
                 for j in (window_start..i).rev() {
                     if best < scores[j] { best = scores[j]; best_anchor_idx = j as i64; }
                 }
             }
 
             if best_anchor_idx >= 0 && best_anchor_idx < end_j {
-                let sc = compute_chain_score(
-                    &a[i], &a[best_anchor_idx as usize],
-                    max_dist_x, max_dist_y, bw,
-                    opt.chn_pen_gap, opt.chn_pen_skip, false, 1,
-                );
+                let sc = compute_chain_score(&a[i], &a[best_anchor_idx as usize],
+                    max_dist_x, max_dist_y, bw, opt.chn_pen_gap, opt.chn_pen_skip, false, 1);
                 if sc != i32::MIN && best_score < sc + scores[best_anchor_idx as usize] {
                     best_score = sc + scores[best_anchor_idx as usize];
                     best_predecessor = best_anchor_idx;
@@ -1485,91 +1497,65 @@ pub(crate) unsafe fn chain_anchors_neon(
             -1
         };
 
-        // Phase 1: NEON batch score computation
-        if i > window_start {
-            compute_chain_scores_batch_neon(
-                soa_query_pos[i],
-                soa_ref_pos[i],
-                soa_rid_strand[i],
-                &soa_ref_pos,
-                &soa_query_pos,
-                &soa_query_span,
-                &soa_rid_strand,
-                max_dist_x,
-                max_dist_y,
-                bw,
-                opt.chn_pen_gap,
-                opt.chn_pen_skip,
-                &mut soa_sc_buf,
-                window_start,
-                i,
-            );
-        }
-
-        // Phase 2: Scalar skip/visited logic (identical to AVX2 path)
         if no_chain_skip {
+            if i > window_start {
+                compute_chain_scores_batch_neon(
+                    soa_query_pos[i], soa_ref_pos[i], soa_rid_strand[i],
+                    &soa_ref_pos, &soa_query_pos, &soa_query_span, &soa_rid_strand,
+                    max_dist_x, max_dist_y, bw,
+                    opt.chn_pen_gap, opt.chn_pen_skip,
+                    &mut soa_sc_buf, window_start, i,
+                );
+            }
             for j in window_start..i {
                 let sc = soa_sc_buf[j];
-                if sc == i32::MIN {
-                    continue;
-                }
+                if sc == i32::MIN { continue; }
                 let total_sc = sc + scores[j];
-                if total_sc > best_score {
-                    best_score = total_sc;
-                    best_predecessor = j as i64;
-                }
+                if total_sc > best_score { best_score = total_sc; best_predecessor = j as i64; }
             }
         } else {
-            for j in (window_start..i).rev() {
-                let sc = soa_sc_buf[j];
-                if sc == i32::MIN {
-                    continue;
+            const CHUNK_SIZE: usize = 64;
+            let mut chunk_end = i;
+            let mut skip_fired = false;
+            while chunk_end > window_start {
+                let chunk_start = if chunk_end >= window_start + CHUNK_SIZE { chunk_end - CHUNK_SIZE } else { window_start };
+
+                compute_chain_scores_batch_neon(
+                    soa_query_pos[i], soa_ref_pos[i], soa_rid_strand[i],
+                    &soa_ref_pos, &soa_query_pos, &soa_query_span, &soa_rid_strand,
+                    max_dist_x, max_dist_y, bw,
+                    opt.chn_pen_gap, opt.chn_pen_skip,
+                    &mut soa_sc_buf, chunk_start, chunk_end,
+                );
+
+                for j in (chunk_start..chunk_end).rev() {
+                    let sc = soa_sc_buf[j];
+                    if sc == i32::MIN { continue; }
+                    let total_sc = sc + scores[j];
+                    if total_sc > best_score {
+                        best_score = total_sc; best_predecessor = j as i64;
+                        if skip_count > 0 { skip_count -= 1; }
+                    } else if visited[j] == i as i32 {
+                        skip_count += 1;
+                        if skip_count > opt.max_chain_skip { end_j = j as i64; skip_fired = true; break; }
+                    }
+                    if predecessors[j] >= 0 { visited[predecessors[j] as usize] = i as i32; }
                 }
 
-                let total_sc = sc + scores[j];
-                if total_sc > best_score {
-                    best_score = total_sc;
-                    best_predecessor = j as i64;
-                    if skip_count > 0 {
-                        skip_count -= 1;
-                    }
-                } else if visited[j] == i as i32 {
-                    skip_count += 1;
-                    if skip_count > opt.max_chain_skip {
-                        end_j = j as i64;
-                        break;
-                    }
-                }
-                if predecessors[j] >= 0 {
-                    visited[predecessors[j] as usize] = i as i32;
-                }
+                if skip_fired { break; }
+                chunk_end = chunk_start;
             }
 
-            if best_anchor_idx < 0
-                || a[i].x - a[best_anchor_idx as usize].x > max_dist_x as u64
-            {
-                let mut best = i32::MIN;
-                best_anchor_idx = -1;
+            if best_anchor_idx < 0 || a[i].x - a[best_anchor_idx as usize].x > max_dist_x as u64 {
+                let mut best = i32::MIN; best_anchor_idx = -1;
                 for j in (window_start..i).rev() {
-                    if best < scores[j] {
-                        best = scores[j];
-                        best_anchor_idx = j as i64;
-                    }
+                    if best < scores[j] { best = scores[j]; best_anchor_idx = j as i64; }
                 }
             }
 
             if best_anchor_idx >= 0 && best_anchor_idx < end_j {
-                let sc = compute_chain_score(
-                    &a[i],
-                    &a[best_anchor_idx as usize],
-                    max_dist_x,
-                    max_dist_y,
-                    bw,
-                    opt.chn_pen_gap,
-                    opt.chn_pen_skip,
-                    false,
-                    1,
-                );
+                let sc = compute_chain_score(&a[i], &a[best_anchor_idx as usize],
+                    max_dist_x, max_dist_y, bw, opt.chn_pen_gap, opt.chn_pen_skip, false, 1);
                 if sc != i32::MIN && best_score < sc + scores[best_anchor_idx as usize] {
                     best_score = sc + scores[best_anchor_idx as usize];
                     best_predecessor = best_anchor_idx;
@@ -1910,66 +1896,65 @@ pub(crate) unsafe fn chain_anchors_wasm(
 
         let mut end_j: i64 = if window_start > 0 { window_start as i64 - 1 } else { -1 };
 
-        if i > window_start {
-            compute_chain_scores_batch_wasm(
-                soa_query_pos[i], soa_ref_pos[i], soa_rid_strand[i],
-                &soa_ref_pos, &soa_query_pos, &soa_query_span, &soa_rid_strand,
-                max_dist_x, max_dist_y, bw,
-                opt.chn_pen_gap, opt.chn_pen_skip,
-                &mut soa_sc_buf, window_start, i,
-            );
-        }
-
         if no_chain_skip {
+            if i > window_start {
+                compute_chain_scores_batch_wasm(
+                    soa_query_pos[i], soa_ref_pos[i], soa_rid_strand[i],
+                    &soa_ref_pos, &soa_query_pos, &soa_query_span, &soa_rid_strand,
+                    max_dist_x, max_dist_y, bw,
+                    opt.chn_pen_gap, opt.chn_pen_skip,
+                    &mut soa_sc_buf, window_start, i,
+                );
+            }
             for j in window_start..i {
                 let sc = soa_sc_buf[j];
                 if sc == i32::MIN { continue; }
                 let total_sc = sc + scores[j];
-                if total_sc > best_score {
-                    best_score = total_sc;
-                    best_predecessor = j as i64;
-                }
+                if total_sc > best_score { best_score = total_sc; best_predecessor = j as i64; }
             }
         } else {
-            for j in (window_start..i).rev() {
-                let sc = soa_sc_buf[j];
-                if sc == i32::MIN { continue; }
-                let total_sc = sc + scores[j];
-                if total_sc > best_score {
-                    best_score = total_sc;
-                    best_predecessor = j as i64;
-                    if skip_count > 0 { skip_count -= 1; }
-                } else if visited[j] == i as i32 {
-                    skip_count += 1;
-                    if skip_count > opt.max_chain_skip {
-                        end_j = j as i64;
-                        break;
+            const CHUNK_SIZE: usize = 64;
+            let mut chunk_end = i;
+            let mut skip_fired = false;
+            while chunk_end > window_start {
+                let chunk_start = if chunk_end >= window_start + CHUNK_SIZE { chunk_end - CHUNK_SIZE } else { window_start };
+
+                compute_chain_scores_batch_wasm(
+                    soa_query_pos[i], soa_ref_pos[i], soa_rid_strand[i],
+                    &soa_ref_pos, &soa_query_pos, &soa_query_span, &soa_rid_strand,
+                    max_dist_x, max_dist_y, bw,
+                    opt.chn_pen_gap, opt.chn_pen_skip,
+                    &mut soa_sc_buf, chunk_start, chunk_end,
+                );
+
+                for j in (chunk_start..chunk_end).rev() {
+                    let sc = soa_sc_buf[j];
+                    if sc == i32::MIN { continue; }
+                    let total_sc = sc + scores[j];
+                    if total_sc > best_score {
+                        best_score = total_sc; best_predecessor = j as i64;
+                        if skip_count > 0 { skip_count -= 1; }
+                    } else if visited[j] == i as i32 {
+                        skip_count += 1;
+                        if skip_count > opt.max_chain_skip { end_j = j as i64; skip_fired = true; break; }
                     }
+                    if predecessors[j] >= 0 { visited[predecessors[j] as usize] = i as i32; }
                 }
-                if predecessors[j] >= 0 {
-                    visited[predecessors[j] as usize] = i as i32;
-                }
+
+                if skip_fired { break; }
+                chunk_end = chunk_start;
             }
 
-            if best_anchor_idx < 0
-                || a[i].x - a[best_anchor_idx as usize].x > max_dist_x as u64
-            {
-                let mut best = i32::MIN;
-                best_anchor_idx = -1;
+            if best_anchor_idx < 0 || a[i].x - a[best_anchor_idx as usize].x > max_dist_x as u64 {
+                let mut best = i32::MIN; best_anchor_idx = -1;
                 for j in (window_start..i).rev() {
-                    if best < scores[j] {
-                        best = scores[j];
-                        best_anchor_idx = j as i64;
-                    }
+                    if best < scores[j] { best = scores[j]; best_anchor_idx = j as i64; }
                 }
             }
 
             if best_anchor_idx >= 0 && best_anchor_idx < end_j {
-                let sc = compute_chain_score(
-                    &a[i], &a[best_anchor_idx as usize],
-                    max_dist_x, max_dist_y, bw,
-                    opt.chn_pen_gap, opt.chn_pen_skip, false, 1,
-                );
+                let sc = compute_chain_score(&a[i], &a[best_anchor_idx as usize],
+                    max_dist_x, max_dist_y, bw, opt.chn_pen_gap, opt.chn_pen_skip, false, 1);
                 if sc != i32::MIN && best_score < sc + scores[best_anchor_idx as usize] {
                     best_score = sc + scores[best_anchor_idx as usize];
                     best_predecessor = best_anchor_idx;
