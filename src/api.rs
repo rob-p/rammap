@@ -339,7 +339,7 @@ impl Aligner {
 
     /// Save the index to a file (RMMI format).
     pub fn save_index(&self, path: &str) -> io::Result<()> {
-        self.index.save(path).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        self.index.save(path).map_err(|e| io::Error::other(e))
     }
 
     /// Access the underlying index.
@@ -489,7 +489,7 @@ fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
         }
 
         let cigar_ops = cigar.as_ref().map(|s| parse_cigar_string(s));
-        let is_spliced = cigar_ops.as_ref().map_or(false, |ops| ops.iter().any(|op| op.op == 3));
+        let is_spliced = cigar_ops.as_ref().is_some_and(|ops| ops.iter().any(|op| op.op == 3));
 
         // Extract md tag
         let mut md = None;

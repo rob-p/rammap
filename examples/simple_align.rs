@@ -40,9 +40,9 @@ fn main() {
 
         let result = aligner.map_seq(name, seq);
 
-        if !result.alignments.is_empty() {
+        if !result.mappings.is_empty() {
             n_aligned += 1;
-            for aln in &result.alignments {
+            for aln in &result.mappings {
                 let strand = match aln.strand { Strand::Forward => '+', Strand::Reverse => '-' };
                 // Print PAF-like output
                 println!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
