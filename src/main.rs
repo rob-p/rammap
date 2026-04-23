@@ -222,8 +222,8 @@ struct AlignArgs {
     #[arg(short = 'e')]
     pub occ_dist: Option<i32>,
 
-    /// Minibatch size for mapping
-    #[arg(short = 'K')]
+    /// Minibatch size for mapping (query bases per batch; suffix K/M/G OK) [500M / preset dependent]
+    #[arg(short = 'K', long = "mb-size")]
     pub mini_batch_size: Option<String>,
 
     /// Whether to output secondary alignments (yes/no)
@@ -708,6 +708,11 @@ fn run(cli: AlignArgs) -> anyhow::Result<()> {
         .map(|s| parse_num(s) as u64)
         .unwrap_or(8_000_000_000); // 8G default
 
+    // -K: overrides opt.mini_batch_size set by preset (defaults: 500M, 50M for sr/short, 100M for splice:sr)
+    if let Some(s) = cli.mini_batch_size.as_ref() {
+        opt.mini_batch_size = parse_num(s);
+    }
+
     // Parse query files from positional args
     let frag_mode = opt.flags.contains(AlignFlags::FRAG_MODE);
     let no_query = cli.queries.is_empty() && cli.dump_index.is_some();
@@ -1145,6 +1150,7 @@ fn map_one_part(
     let two_file_pe = run.two_file_pe;
     let copy_comment = run.copy_comment;
     let out_cfg = run.out_cfg;
+    let mini_batch_size = opt.mini_batch_size as u64;
     // mid_occ per-part: only calculate if still <= 0.
     // Once calculated for the first part, it stays for subsequent parts (options.c:73).
     if opt.seeding.mid_occ == 0 {
@@ -1230,7 +1236,6 @@ fn map_one_part(
     let mut total_stats = AlignmentStats::default();
     let mut record_iter = reader.records();
     let mut record_iter2 = reader2.map(|r| r.records());
-    const CHUNK_SIZE: usize = 4096;
 
     if pe_mode {
         type PairData = (String, Vec<u8>, Option<String>, Option<String>, String, Vec<u8>, Option<String>, Option<String>);
@@ -1243,8 +1248,9 @@ fn map_one_part(
             std::thread::scope(|s| -> anyhow::Result<()> {
                 s.spawn(move || {
                     loop {
-                        let mut chunk_data: Vec<PairData> = Vec::with_capacity(CHUNK_SIZE);
-                        for _ in 0..CHUNK_SIZE {
+                        let mut chunk_data: Vec<PairData> = Vec::new();
+                        let mut chunk_bases: u64 = 0;
+                        loop {
                             let r1 = record_iter.next();
                             let rec1 = match r1 {
                                 Some(Ok(r)) => r,
@@ -1270,10 +1276,12 @@ fn map_one_part(
                             let c1 = if copy_comment { rec1.description().map(|s| s.to_string()) } else { None };
                             let q2 = rec2.quality().map(|qs| String::from_utf8_lossy(qs).to_string());
                             let c2 = if copy_comment { rec2.description().map(|s| s.to_string()) } else { None };
+                            chunk_bases += (rec1.sequence().len() + rec2.sequence().len()) as u64;
                             chunk_data.push((
                                 rec1.name().to_string(), rec1.sequence().to_vec(), q1, c1,
                                 rec2.name().to_string(), rec2.sequence().to_vec(), q2, c2,
                             ));
+                            if chunk_bases >= mini_batch_size { break; }
                         }
                         let done = chunk_data.is_empty();
                         if tx.send(chunk_data).is_err() { break; }
@@ -1318,8 +1326,9 @@ fn map_one_part(
         #[cfg(not(feature = "parallel"))]
         {
             loop {
-                let mut chunk_data: Vec<PairData> = Vec::with_capacity(CHUNK_SIZE);
-                for _ in 0..CHUNK_SIZE {
+                let mut chunk_data: Vec<PairData> = Vec::new();
+                let mut chunk_bases: u64 = 0;
+                loop {
                     let r1 = if two_file_pe {
                         record_iter.next()
                     } else {
@@ -1349,10 +1358,12 @@ fn map_one_part(
                     let c1 = if copy_comment { rec1.description().map(|s| s.to_string()) } else { None };
                     let q2 = rec2.quality().map(|qs| String::from_utf8_lossy(qs).to_string());
                     let c2 = if copy_comment { rec2.description().map(|s| s.to_string()) } else { None };
+                    chunk_bases += (rec1.sequence().len() + rec2.sequence().len()) as u64;
                     chunk_data.push((
                         rec1.name().to_string(), rec1.sequence().to_vec(), q1, c1,
                         rec2.name().to_string(), rec2.sequence().to_vec(), q2, c2,
                     ));
+                    if chunk_bases >= mini_batch_size { break; }
                 }
 
                 if chunk_data.is_empty() { break; }
@@ -1386,12 +1397,14 @@ fn map_one_part(
             std::thread::scope(|s| -> anyhow::Result<()> {
                 s.spawn(move || {
                     loop {
-                        let mut chunk_data: Vec<SeData> = Vec::with_capacity(CHUNK_SIZE);
-                        for _ in 0..CHUNK_SIZE {
+                        let mut chunk_data: Vec<SeData> = Vec::new();
+                        let mut chunk_bases: u64 = 0;
+                        loop {
                             match record_iter.next() {
                                 Some(Ok(r)) => {
                                     let q = r.quality().map(|qs| String::from_utf8_lossy(qs).to_string());
                                     let c = if copy_comment { r.description().map(|s| s.to_string()) } else { None };
+                                    chunk_bases += r.sequence().len() as u64;
                                     chunk_data.push((r.name().to_string(), r.sequence().to_vec(), q, c));
                                 },
                                 Some(Err(e)) => {
@@ -1400,6 +1413,7 @@ fn map_one_part(
                                 },
                                 None => break,
                             }
+                            if chunk_bases >= mini_batch_size { break; }
                         }
                         let done = chunk_data.is_empty();
                         if tx.send(chunk_data).is_err() { break; }
@@ -1443,12 +1457,14 @@ fn map_one_part(
         #[cfg(not(feature = "parallel"))]
         {
             loop {
-                let mut chunk_data = Vec::with_capacity(CHUNK_SIZE);
-                for _ in 0..CHUNK_SIZE {
+                let mut chunk_data: Vec<(String, Vec<u8>, Option<String>, Option<String>)> = Vec::new();
+                let mut chunk_bases: u64 = 0;
+                loop {
                     match record_iter.next() {
                         Some(Ok(r)) => {
                             let q = r.quality().map(|qs| String::from_utf8_lossy(qs).to_string());
                             let c = if copy_comment { r.description().map(|s| s.to_string()) } else { None };
+                            chunk_bases += r.sequence().len() as u64;
                             chunk_data.push((r.name().to_string(), r.sequence().to_vec(), q, c));
                         },
                         Some(Err(e)) => {
@@ -1457,6 +1473,7 @@ fn map_one_part(
                         },
                         None => break,
                     }
+                    if chunk_bases >= mini_batch_size { break; }
                 }
 
                 if chunk_data.is_empty() { break; }

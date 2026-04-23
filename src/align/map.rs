@@ -177,6 +177,7 @@ pub struct MapOptions {
     pub filtering: FilteringParams,
     pub pairing: PairedEndParams,
     pub flags: AlignFlags,
+    pub mini_batch_size: i64,
 }
 
 impl Default for MapOptions {
@@ -252,6 +253,7 @@ impl Default for MapOptions {
                 pe_bonus: 33,
             },
             flags: AlignFlags::empty(),
+            mini_batch_size: 500_000_000,
         }
     }
 }

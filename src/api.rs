@@ -612,6 +612,7 @@ pub fn apply_preset_str(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_h
             opt.filtering.best_n = 20;
             opt.seeding.mid_occ = 1000;
             opt.seeding.max_occ = 5000;
+            opt.mini_batch_size = 50_000_000;
         },
         p if p.starts_with("splice") || p == "cdna" => {
             *k = 15; *w = 5;
@@ -636,6 +637,7 @@ pub fn apply_preset_str(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_h
                 opt.alignment.min_dp_len = 20;
                 opt.pairing.pe_ori = 1;
                 opt.filtering.best_n = 10;
+                opt.mini_batch_size = 100_000_000;
             }
         },
         "ava-ont" => {
