@@ -2472,10 +2472,17 @@ pub fn align_and_format_pair(
     let qseq2_work = if flip_r2 { rev_comp(qseq2) } else { qseq2.to_vec() };
 
     let is_weak = opt.flags.contains(AlignFlags::WEAK_PAIRING);
+    let is_independ = opt.flags.contains(AlignFlags::INDEPEND_SEG);
 
     // frag_gap: gap parameter for pair assignment (strong path uses computed max_chain_gap_ref,
     // weak path uses opt.chaining.max_gap_ref)
-    let (mut pq1, mut pq2, frag_gap, multi_stats) = if is_weak {
+    let (mut pq1, mut pq2, frag_gap, multi_stats) = if is_independ {
+        // Fully independent mapping: each segment treated as a standalone single-end read.
+        // No joint chaining, no pair rescoring — each read keeps its own rep_len and hash seed.
+        let pq1 = process_query(opt, mi, qname1, &qseq1_work, ctx, map_ctx, junc_db, out);
+        let pq2 = process_query(opt, mi, qname2, &qseq2_work, ctx, map_ctx, junc_db, out);
+        (pq1, pq2, opt.chaining.max_gap_ref, AlignmentStats::default())
+    } else if is_weak {
         // Weak pairing: map each read independently
         // The FIRST segment's qname is used for ALL segments. This affects read_hash
         // (via compute_read_hash), which propagates to chain hashes and pair tiebreaking.
@@ -2508,8 +2515,9 @@ pub fn align_and_format_pair(
     };
 
     // Call pair assignment when PE with CIGAR enabled
-    // Always call pair for n_segs==2 && pe_ori>=0 && CIGAR mode
-    if out.do_cigar && opt.pairing.pe_ori >= 0 {
+    // Always call pair for n_segs==2 && pe_ori>=0 && CIGAR mode.
+    // Skipped under INDEPEND_SEG (--pairing no): reads are treated as unrelated.
+    if out.do_cigar && opt.pairing.pe_ori >= 0 && !is_independ {
         let qlens = [qseq1_work.len() as i32, qseq2_work.len() as i32];
         let sub_diff = opt.scoring.match_score * 2 + opt.scoring.mismatch_penalty;
 

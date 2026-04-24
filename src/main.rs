@@ -1587,6 +1587,7 @@ fn map_one_part_split(
     let mut record_iter = reader.records();
     let mut record_iter2 = reader2.map(|r| r.records());
     let is_weak = opt.flags.contains(AlignFlags::WEAK_PAIRING);
+    let is_independ = opt.flags.contains(AlignFlags::INDEPEND_SEG);
     let pe_ori = opt.pairing.pe_ori;
     let flip_r1 = (pe_ori >> 1) & 1 != 0;
     let flip_r2 = pe_ori & 1 != 0;
@@ -1623,7 +1624,13 @@ fn map_one_part_split(
             let qseq1_work = if flip_r1 { rev_comp(&qseq1) } else { qseq1.clone() };
             let qseq2_work = if flip_r2 { rev_comp(&qseq2) } else { qseq2.clone() };
 
-            let (pq1, pq2, frag_gap) = if is_weak {
+            let (pq1, pq2, frag_gap) = if is_independ {
+                let pq1 = process_query(opt, mi, &qname1, &qseq1_work, &mut ctx, &mut map_ctx,
+                    junc_db.as_ref(), out_cfg);
+                let pq2 = process_query(opt, mi, &_qname2, &qseq2_work, &mut ctx, &mut map_ctx,
+                    junc_db.as_ref(), out_cfg);
+                (pq1, pq2, opt.chaining.max_gap_ref)
+            } else if is_weak {
                 let pq1 = process_query(opt, mi, &qname1, &qseq1_work, &mut ctx, &mut map_ctx,
                     junc_db.as_ref(), out_cfg);
                 let pq2 = process_query(opt, mi, &qname1, &qseq2_work, &mut ctx, &mut map_ctx,
