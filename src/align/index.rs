@@ -1,5 +1,5 @@
 
-use crate::align::sketch::sketch_sequence;
+use crate::align::sketch::{sketch_sequence, Minimizer};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use serde::{Serialize, Deserialize};
@@ -404,37 +404,75 @@ impl Index {
         let mut packed = vec![0u32; n_u32];
         let mut buckets: Vec<Vec<(u64, u64)>> = vec![Vec::new(); n_buckets];
 
-        // Sequential sketch: process one sequence at a time.
-        // Pack + sketch each, distribute entries to buckets, then drop ASCII.
-        // This keeps peak memory to buckets + packed_seqs (no accumulated ASCII).
-        // Parallelism comes from the bucket post-processing step, not sketching.
-        let mut minimizers = Vec::new();
-        for (rid, seq_bytes) in seq_data.drain(..).enumerate() {
-            let len = idx.seqs[rid].len;
-            let goff = idx.seqs[rid].offset as usize;
+        // Process sequences in chunks: drain a chunk, pack sequentially, parallel
+        // sketch into per-sequence minimizer Vecs, sequential distribute into
+        // global buckets, drop chunk. This bounds peak memory to roughly
+        // chunk_seqs + chunk_minimizers + global_buckets (rather than holding
+        // all sequences and all per-thread bucket arrays simultaneously).
+        //
+        // Output equivalence: sketch_sequence is deterministic given (seq, rid, w, k),
+        // so the set of (hash, y) pairs in each bucket is the same as sequential.
+        // y = (rid << 32) | (pos << 1) | strand makes every pair unique, so the
+        // subsequent sort_unstable() yields a fully deterministic order independent
+        // of input order. The bit-identical .mmi file is verified in tests.
+        const CHUNK_SIZE: usize = 32;
+        let mut rid_offset = 0usize;
+        while !seq_data.is_empty() {
+            let take_n = CHUNK_SIZE.min(seq_data.len());
+            // Drain chunk; uppercase in-place for HPC (homopolymer detection in
+            // sketch compares raw bytes, so case must be consistent with pack).
+            let chunk: Vec<Vec<u8>> = seq_data.drain(..take_n).map(|mut s| {
+                if is_hpc {
+                    for b in s.iter_mut() { *b = b.to_ascii_uppercase(); }
+                }
+                s
+            }).collect();
 
-            let ascii = if is_hpc {
-                let mut n = seq_bytes;
-                for b in n.iter_mut() { *b = b.to_ascii_uppercase(); }
-                n
-            } else {
-                seq_bytes
-            };
-
-            // Pack into global 4-bit array.
-            for (i, &b) in ascii.iter().enumerate() {
-                let gpos = goff + i;
-                packed[gpos >> 3] |= NT4_TABLE[b as usize] << (((gpos & 7) << 2) as u32);
+            // Pack chunk sequentially. Adjacent sequences may share u32s at byte
+            // boundaries, so concurrent read-modify-write would race.
+            for (i, seq) in chunk.iter().enumerate() {
+                let rid = rid_offset + i;
+                let goff = idx.seqs[rid].offset as usize;
+                for (j, &b) in seq.iter().enumerate() {
+                    let gpos = goff + j;
+                    packed[gpos >> 3] |= NT4_TABLE[b as usize] << (((gpos & 7) << 2) as u32);
+                }
             }
 
-            // Sketch and distribute to buckets.
-            sketch_sequence(&ascii, len, w, k, rid, is_hpc, &mut minimizers);
-            for m in &minimizers {
-                let hash = m.x >> 8;
-                buckets[(hash & mask) as usize].push((hash, m.y));
+            // Parallel-sketch each sequence into its own minimizer Vec.
+            #[cfg(feature = "parallel")]
+            let chunk_minis: Vec<Vec<Minimizer>> = chunk.par_iter().enumerate()
+                .map(|(i, ascii)| {
+                    let rid = rid_offset + i;
+                    let len = idx.seqs[rid].len;
+                    let mut m = Vec::new();
+                    sketch_sequence(ascii, len, w, k, rid, is_hpc, &mut m);
+                    m
+                })
+                .collect();
+            #[cfg(not(feature = "parallel"))]
+            let chunk_minis: Vec<Vec<Minimizer>> = chunk.iter().enumerate()
+                .map(|(i, ascii)| {
+                    let rid = rid_offset + i;
+                    let len = idx.seqs[rid].len;
+                    let mut m = Vec::new();
+                    sketch_sequence(ascii, len, w, k, rid, is_hpc, &mut m);
+                    m
+                })
+                .collect();
+
+            // Distribute minimizers into global buckets sequentially. Order of
+            // pushes doesn't affect the sorted bucket output because all (hash, y)
+            // pairs are unique.
+            for minis in chunk_minis {
+                for m in minis {
+                    let hash = m.x >> 8;
+                    buckets[(hash & mask) as usize].push((hash, m.y));
+                }
             }
-            minimizers.clear();
-            // ascii dropped here — one sequence at a time
+
+            rid_offset += take_n;
+            // chunk dropped here — sequences freed before next chunk
         }
         drop(seq_data);
         idx.packed_seqs = packed;

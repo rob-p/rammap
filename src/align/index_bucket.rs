@@ -9,68 +9,92 @@
 //! All positions (including singletons) live in `positions[]` so that the
 //! existing `get_range`/`get_by_range` API works without changes.
 
-use serde::{Serialize, Deserialize};
+use serde::{Serialize, Deserialize, Serializer, Deserializer};
+use serde::de::SeqAccess;
 use super::index::SeedLookup;
+use hashbrown::HashTable;
 
-/// Sentinel for empty hash table slots.
-const EMPTY_KEY: u64 = u64::MAX;
+/// A single bucket's hash table — hashbrown SwissTable for ~87.5% load factor.
+/// Keys are u64 hash suffixes (hash >> bucket_bits) and already well-distributed
+/// minimizer hashes, so we pass them directly as the hash to skip rehashing.
+/// Entries are stored as (key, val); val packs (offset: u32, count: u32).
+#[derive(Debug, Default)]
+struct Bucket(HashTable<(u64, u64)>);
 
-/// A single bucket's hash table. Open-addressing with linear probing.
-/// Keys are u64 hash suffixes (hash >> bucket_bits). Must be u64 to avoid
-/// truncation for large k (k=25 produces 50-bit hashes; after removing
-/// bucket_bits the suffix can exceed 32 bits).
-/// Values are packed (offset: u32, count: u32) as a single u64.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Bucket {
-    keys: Vec<u64>,
-    vals: Vec<u64>,
-    mask: u64, // capacity - 1
+#[inline]
+fn bucket_empty() -> Bucket {
+    Bucket(HashTable::new())
+}
+
+#[inline]
+fn bucket_with_capacity(n: usize) -> Bucket {
+    Bucket(HashTable::with_capacity(n))
 }
 
 impl Bucket {
-    fn empty() -> Self {
-        Self { keys: Vec::new(), vals: Vec::new(), mask: 0 }
-    }
-
-    fn with_capacity(n: usize) -> Self {
-        if n == 0 { return Self::empty(); }
-        let cap = ((n * 4 / 3) + 1).next_power_of_two().max(4);
-        let keys = vec![EMPTY_KEY; cap];
-        let vals = vec![0u64; cap];
-        Self { keys, vals, mask: (cap - 1) as u64 }
-    }
-
     #[inline]
-    fn insert(&mut self, key: u64, value: u64) {
-        let mut idx = key & self.mask;
-        loop {
-            let i = idx as usize;
-            if self.keys[i] == EMPTY_KEY {
-                self.keys[i] = key;
-                self.vals[i] = value;
-                return;
-            }
-            idx = (idx + 1) & self.mask;
-        }
+    fn insert(&mut self, key: u64, val: u64) {
+        self.0.insert_unique(key, (key, val), |&(k, _)| k);
     }
 
     #[inline]
     fn get(&self, key: u64) -> Option<u64> {
-        if self.mask == 0 { return None; }
-        let mut idx = key & self.mask;
-        loop {
-            let i = idx as usize;
-            let k = self.keys[i];
-            if k == EMPTY_KEY { return None; }
-            if k == key { return Some(self.vals[i]); }
-            idx = (idx + 1) & self.mask;
-        }
+        self.0.find(key, |&(k, _)| k == key).map(|&(_, v)| v)
     }
 
-    /// Iterate over all occupied (key, value) pairs.
-    fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        self.keys.iter().copied().zip(self.vals.iter().copied())
-            .filter(|(k, _)| *k != EMPTY_KEY)
+    #[inline]
+    fn is_empty(&self) -> bool { self.0.is_empty() }
+
+    #[inline]
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut u64> + '_ {
+        self.0.iter_mut().map(|(_, v)| v)
+    }
+
+    #[inline]
+    fn values(&self) -> impl Iterator<Item = &u64> + '_ {
+        self.0.iter().map(|(_, v)| v)
+    }
+}
+
+impl Clone for Bucket {
+    fn clone(&self) -> Self {
+        let mut t = HashTable::with_capacity(self.0.len());
+        for &entry in self.0.iter() {
+            t.insert_unique(entry.0, entry, |&(k, _)| k);
+        }
+        Bucket(t)
+    }
+}
+
+impl Serialize for Bucket {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = ser.serialize_seq(Some(self.0.len()))?;
+        for &entry in self.0.iter() {
+            seq.serialize_element(&entry)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Bucket {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Bucket;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("seq of (u64,u64)")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Bucket, A::Error> {
+                let n = s.size_hint().unwrap_or(0);
+                let mut t = HashTable::with_capacity(n);
+                while let Some(entry) = s.next_element::<(u64, u64)>()? {
+                    t.insert_unique(entry.0, entry, |&(k, _)| k);
+                }
+                Ok(Bucket(t))
+            }
+        }
+        de.deserialize_seq(V)
     }
 }
 
@@ -104,11 +128,11 @@ impl BucketHashLookup {
 
         for (p, hash_entries) in &bucket_data {
             if hash_entries.is_empty() {
-                buckets.push(Bucket::empty());
+                buckets.push(bucket_empty());
                 continue;
             }
 
-            let mut ht = Bucket::with_capacity(hash_entries.len());
+            let mut ht = bucket_with_capacity(hash_entries.len());
 
             for &(key, value) in hash_entries {
                 // minimap2 key: (hash_suffix << 1) | singleton_flag
@@ -152,7 +176,7 @@ impl BucketHashLookup {
         // Returns (Bucket, Vec<u64>) per input bucket.
         let process_one = |b: Vec<(u64, u64)>| -> (Bucket, Vec<u64>) {
             if b.is_empty() {
-                return (Bucket::empty(), Vec::new());
+                return (bucket_empty(), Vec::new());
             }
             // Count unique hashes for hash table sizing.
             let mut n_unique = 0usize;
@@ -167,7 +191,7 @@ impl BucketHashLookup {
                 }
             }
 
-            let mut ht = Bucket::with_capacity(n_unique);
+            let mut ht = bucket_with_capacity(n_unique);
             let mut local_pos: Vec<u64> = Vec::new();
 
             let mut i = 0;
@@ -213,11 +237,9 @@ impl BucketHashLookup {
             // Fix up offsets to global positions array.
             let global_offset = positions.len() as u64;
             if global_offset > 0 {
-                for i in 0..ht.keys.len() {
-                    if ht.keys[i] != EMPTY_KEY {
-                        let old = ht.vals[i];
-                        ht.vals[i] = ((old >> 32) + global_offset) << 32 | (old & 0xFFFFFFFF);
-                    }
+                for v in ht.values_mut() {
+                    let old = *v;
+                    *v = ((old >> 32) + global_offset) << 32 | (old & 0xFFFFFFFF);
                 }
             }
             positions.extend_from_slice(&local_pos);
@@ -232,32 +254,21 @@ impl BucketHashLookup {
 impl BucketHashLookup {
     /// Prefetch the bucket for a hash value into L1 cache.
     /// Call this 5-10 iterations ahead of the actual lookup.
+    /// With hashbrown's SwissTable internals hidden, we prefetch the bucket struct
+    /// itself; the actual probe location is opaque, so this is a coarser hint.
     #[inline]
     pub fn prefetch(&self, hash: u64) {
         let mask = (1u64 << self.bucket_bits) - 1;
         let bi = (hash & mask) as usize;
         if bi < self.buckets.len() {
-            let bucket = &self.buckets[bi];
-            if bucket.mask > 0 {
-                let key = hash >> self.bucket_bits;
-                let idx = (key & bucket.mask) as usize;
-                // Prefetch the keys and vals arrays at the expected probe position
-                unsafe {
-                    let keys_ptr = bucket.keys.as_ptr().add(idx) as *const u8;
-                    let vals_ptr = bucket.vals.as_ptr().add(idx) as *const u8;
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        std::arch::x86_64::_mm_prefetch(keys_ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
-                        std::arch::x86_64::_mm_prefetch(vals_ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
-                    }
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        std::arch::aarch64::_prefetch(keys_ptr as *const i8, std::arch::aarch64::_PREFETCH_READ, std::arch::aarch64::_PREFETCH_LOCALITY3);
-                        std::arch::aarch64::_prefetch(vals_ptr as *const i8, std::arch::aarch64::_PREFETCH_READ, std::arch::aarch64::_PREFETCH_LOCALITY3);
-                    }
-                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                    { let _ = (keys_ptr, vals_ptr); }
-                }
+            let bucket_ptr = &self.buckets[bi] as *const _ as *const u8;
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                std::arch::x86_64::_mm_prefetch(bucket_ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                #[cfg(target_arch = "aarch64")]
+                std::arch::aarch64::_prefetch(bucket_ptr as *const i8, std::arch::aarch64::_PREFETCH_READ, std::arch::aarch64::_PREFETCH_LOCALITY3);
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                { let _ = bucket_ptr; }
             }
         }
     }
@@ -309,12 +320,12 @@ impl SeedLookup for BucketHashLookup {
 
     fn occurrence_counts(&self) -> Box<dyn Iterator<Item = u32> + '_> {
         Box::new(self.buckets.iter().flat_map(|b| {
-            b.iter().map(|(_, val)| (val & 0xFFFFFFFF) as u32)
+            b.values().map(|val| (*val & 0xFFFFFFFF) as u32)
         }))
     }
 
     fn is_empty(&self) -> bool {
-        self.buckets.iter().all(|b| b.mask == 0)
+        self.buckets.iter().all(|b| b.is_empty())
     }
 }
 
