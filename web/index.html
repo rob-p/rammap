@@ -158,8 +158,8 @@ table.results td.cigar:hover { color: #111; overflow: visible; white-space: norm
 <div class="status" id="status"></div>
 
 <script type="module">
-let refText = null;
-let queryText = null;
+let refFile = null;
+let queryFile = null;
 let wasmReady = false;
 let running = false;
 let currentTab = 'raw';
@@ -178,7 +178,7 @@ function log(msg) {
 }
 
 function updateRunBtn() {
-  runBtn.disabled = !(wasmReady && refText && queryText && !running);
+  runBtn.disabled = !(wasmReady && refFile && queryFile && !running);
 }
 
 function formatSize(bytes) {
@@ -290,7 +290,7 @@ function renderSamTable(lines) {
 }
 
 // --- Drop zones ---
-function setupDropZone(zoneId, fileId, onLoad) {
+function setupDropZone(zoneId, fileId, onLoad, kind) {
   const zone = document.getElementById(zoneId);
   const input = document.getElementById(fileId);
   zone.addEventListener('click', () => input.click());
@@ -298,26 +298,68 @@ function setupDropZone(zoneId, fileId, onLoad) {
   zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
   zone.addEventListener('drop', e => {
     e.preventDefault(); zone.classList.remove('dragover');
-    if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0], zone, onLoad);
+    if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0], zone, onLoad, kind);
   });
   input.addEventListener('change', () => {
-    if (input.files.length) handleFile(input.files[0], zone, onLoad);
+    if (input.files.length) handleFile(input.files[0], zone, onLoad, kind);
   });
 }
 
-function handleFile(file, zone, onLoad) {
+// Conservative ceilings for the reference. The wasm32 linear memory cap is
+// 4 GB, and the steady-state index for a whole-genome FASTA (packed bases +
+// bucket entries) is ~2 bytes per ref base — so refs above ~1.5 GB of bases
+// will OOM during indexing. We warn well before that.
+const REF_PLAIN_WARN_BYTES = 1.5 * 1024 * 1024 * 1024;     // 1.5 GB plain
+const REF_GZ_WARN_BYTES    = 0.5 * 1024 * 1024 * 1024;     // 0.5 GB compressed (~1.5 GB decompressed)
+
+async function handleFile(file, zone, onSet, kind) {
   zone.classList.add('loaded');
   zone.innerHTML = `<span class="filename">${file.name}</span><span class="filesize">${formatSize(file.size)}</span>`;
-  log(`[*] Loading ${file.name} (${formatSize(file.size)})...`);
-  const reader = new FileReader();
-  reader.onload = () => { onLoad(reader.result); log(`[*] ${file.name} loaded`); updateRunBtn(); };
-  reader.readAsText(file);
+
+  try {
+    // Peek the gzip magic for an early extension-vs-content sanity check.
+    // The actual decode happens in the worker as the file streams in.
+    const hdr = new Uint8Array(await file.slice(0, 2).arrayBuffer());
+    const isGzContent = hdr.length >= 2 && hdr[0] === 0x1f && hdr[1] === 0x8b;
+    const isGzExt = /\.gz$/i.test(file.name);
+    if (isGzExt && !isGzContent) {
+      log(`[!] ${file.name} has a .gz extension but is not gzipped; will read as plain text.`);
+    } else if (!isGzExt && isGzContent) {
+      log(`[!] ${file.name} is gzipped but lacks a .gz extension; will decompress.`);
+    }
+
+    // Size sanity check for the reference. Queries are streamed and aligned
+    // one read at a time, so they don't have the same memory ceiling.
+    if (kind === 'ref') {
+      const limit = isGzContent ? REF_GZ_WARN_BYTES : REF_PLAIN_WARN_BYTES;
+      if (file.size > limit) {
+        const limitStr = formatSize(limit);
+        log(`[!!] ${file.name} (${formatSize(file.size)}${isGzContent ? ', gzipped' : ''}) is above the browser-WASM ceiling`);
+        log(`[!!] of ~${limitStr} for ${isGzContent ? 'compressed' : 'plain-text'} references.`);
+        log(`[!!] WASM32 has a 4 GB linear-memory cap; a whole-genome index (~3 GB) exceeds it.`);
+        log(`[!!] Aligning will likely fail with "unreachable executed" partway through indexing.`);
+        log(`[!!] For genome-scale references, use the native rammap CLI instead.`);
+      }
+    }
+
+    onSet(file);
+    log(`[*] ${file.name} ready (${formatSize(file.size)}${isGzContent ? ', gzipped' : ''})`);
+    updateRunBtn();
+  } catch (err) {
+    zone.classList.remove('loaded');
+    log(`[!] Failed to inspect ${file.name}: ${err.message || err}`);
+  }
 }
 
-setupDropZone('ref-drop', 'ref-file', text => { refText = text; });
-setupDropZone('query-drop', 'query-file', text => { queryText = text; });
+setupDropZone('ref-drop', 'ref-file', f => { refFile = f; }, 'ref');
+setupDropZone('query-drop', 'query-file', f => { queryFile = f; }, 'query');
 
-// --- Web Worker (runs in pkg/ so wasm-bindgen-rayon paths resolve) ---
+// Test hook: assign File objects programmatically (used by headless e2e tests).
+window._rammapSetFiles = (rf, qf) => { refFile = rf; queryFile = qf; updateRunBtn(); };
+
+// --- Web Worker ---
+// The worker lives next to this HTML in web/; it internally imports
+// `../pkg/rammap.js` which resolves to the wasm-pack output one level up.
 let worker = null;
 
 function createWorker(numThreads) {
@@ -325,7 +367,7 @@ function createWorker(numThreads) {
   wasmReady = false;
   updateRunBtn();
 
-  worker = new Worker('../pkg/worker.js', { type: 'module' });
+  worker = new Worker('worker.js', { type: 'module' });
   worker.onmessage = onWorkerMessage;
   worker.postMessage({ type: 'init', data: { numThreads } });
 }
@@ -342,6 +384,14 @@ function onWorkerMessage(e) {
 
   if (type === 'log') {
     log(e.data.text);
+  }
+
+  if (type === 'progress') {
+    if (e.data.message) {
+      log(e.data.message);
+    } else if (typeof e.data.bytes === 'number') {
+      statusEl.textContent = `${e.data.stage === 'ref' ? 'Building index' : 'Aligning'}: ${formatSize(e.data.bytes)} processed`;
+    }
   }
 
   if (type === 'result') {
@@ -372,7 +422,7 @@ function onWorkerMessage(e) {
 
 // --- Align ---
 runBtn.addEventListener('click', () => {
-  if (!refText || !queryText || running) return;
+  if (!refFile || !queryFile || running) return;
 
   running = true;
   updateRunBtn();
@@ -392,7 +442,7 @@ runBtn.addEventListener('click', () => {
   window._t0 = performance.now();
   worker.postMessage({
     type: 'align',
-    data: { refText, queryText, preset, outputSam, outputCigar: cigar }
+    data: { refFile, queryFile, preset, outputSam, outputCigar: cigar }
   });
 });
 

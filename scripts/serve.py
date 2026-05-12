@@ -13,6 +13,10 @@ class COEPHandler(SimpleHTTPRequestHandler):
     def end_headers(self):
         self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
         self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
+        # Disable browser caching during dev: rebuilds happen often and a
+        # stale worker.js paired with a fresh index.html silently breaks the
+        # demo.
+        self.send_header('Cache-Control', 'no-store, max-age=0')
         super().end_headers()
 
 port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080

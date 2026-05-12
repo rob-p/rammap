@@ -89,6 +89,150 @@ pub struct Index {
     pub packed_seqs: Vec<u32>,
 }
 
+/// nt4 encoding lookup: A→0, C→1, G→2, T→3, anything else (including N) →4.
+static NT4_TABLE: [u32; 256] = {
+    let mut t = [4u32; 256];
+    t[b'A' as usize] = 0; t[b'a' as usize] = 0;
+    t[b'C' as usize] = 1; t[b'c' as usize] = 1;
+    t[b'G' as usize] = 2; t[b'g' as usize] = 2;
+    t[b'T' as usize] = 3; t[b't' as usize] = 3;
+    t
+};
+
+/// Incremental index builder. Pack and sketch each sequence as it arrives,
+/// drop the bytes after, then call [`finish`](Self::finish) once all
+/// sequences have been added.
+///
+/// Lets WASM consumers stream a multi-GB reference into the index without
+/// ever holding the full ASCII bytes alongside the packed representation —
+/// peak memory stays ~(packed + buckets) rather than ~(raw + packed + buckets).
+pub struct IndexBuilder {
+    idx: Index,
+    w: usize,
+    k: usize,
+    is_hpc: bool,
+    max_occ: usize,
+    bucket_bits: u32,
+    bucket_mask: u64,
+    packed: Vec<u32>,
+    buckets: Vec<Vec<(u64, u64)>>,
+    offset: usize,
+    /// Reusable per-call minimizer scratch. Allocated once on the first
+    /// large sequence; cleared (not freed) between calls so we don't pay the
+    /// alloc/free round-trip on every chromosome — important on WASM where
+    /// the heap can fragment.
+    minis_scratch: Vec<Minimizer>,
+}
+
+impl IndexBuilder {
+    pub fn new(w: usize, k: usize, is_hpc: bool, max_occ: usize) -> Self {
+        let bucket_bits = 10u32.min((2 * k) as u32);
+        let n_buckets = 1usize << bucket_bits;
+        Self {
+            idx: Index {
+                kmer_size: k,
+                window_size: w,
+                homopolymer_compressed: is_hpc,
+                index: 0,
+                seqs: Vec::new(),
+                backend: LookupBackend::BucketHash(super::index_bucket::BucketHashLookup::empty()),
+                packed_seqs: Vec::new(),
+            },
+            w, k, is_hpc, max_occ,
+            bucket_bits,
+            bucket_mask: (n_buckets - 1) as u64,
+            packed: Vec::new(),
+            buckets: vec![Vec::new(); n_buckets],
+            offset: 0,
+            minis_scratch: Vec::new(),
+        }
+    }
+
+    /// Number of sequences added so far.
+    pub fn num_sequences(&self) -> usize { self.idx.seqs.len() }
+
+    /// Total reference bases packed so far.
+    pub fn total_bases(&self) -> usize { self.offset }
+
+    /// Reserve packed-buffer capacity for an expected total reference base count.
+    /// Optional but recommended for multi-GB streaming builds — avoids the
+    /// repeated doubling reallocation, which can briefly use 3× the final
+    /// packed-buffer size on the last grow. The estimate is an upper bound;
+    /// final size may be smaller.
+    pub fn reserve_bases(&mut self, expected_total: usize) {
+        let n_u32 = expected_total.div_ceil(8);
+        if n_u32 > self.packed.capacity() {
+            self.packed.reserve(n_u32 - self.packed.len());
+        }
+    }
+
+    /// Add one sequence: pack it into the global 4-bit buffer, sketch its
+    /// minimizers, distribute to buckets. The sequence bytes are dropped on
+    /// return.
+    pub fn add_sequence(&mut self, name: String, mut seq: Vec<u8>) {
+        if self.is_hpc {
+            for b in seq.iter_mut() { *b = b.to_ascii_uppercase(); }
+        }
+
+        let rid = self.idx.seqs.len();
+        let len = seq.len();
+        let goff = self.offset;
+        self.idx.seqs.push(TargetSequence {
+            name,
+            len,
+            offset: goff as u64,
+            is_alt: false,
+        });
+
+        // Grow the packed buffer for the new bases (8 nibbles per u32).
+        let new_offset = goff + len;
+        let n_u32_needed = new_offset.div_ceil(8);
+        if n_u32_needed > self.packed.len() {
+            self.packed.resize(n_u32_needed, 0);
+        }
+
+        // Pack into the global buffer. Adjacent sequences may share the
+        // boundary u32 at byte offsets not divisible by 8, so this must
+        // remain sequential.
+        for (j, &b) in seq.iter().enumerate() {
+            let gpos = goff + j;
+            self.packed[gpos >> 3] |= NT4_TABLE[b as usize] << (((gpos & 7) << 2) as u32);
+        }
+
+        // Sketch into the persistent scratch Vec (cleared by sketch_sequence),
+        // then distribute. Keeping the Vec alive across calls avoids a
+        // ~13M-entry alloc/free per chromosome.
+        sketch_sequence(&seq, len, self.w, self.k, rid, self.is_hpc, &mut self.minis_scratch);
+        for &m in &self.minis_scratch {
+            let hash = m.x >> 8;
+            self.buckets[(hash & self.bucket_mask) as usize].push((hash, m.y));
+        }
+
+        self.offset = new_offset;
+        // seq (Vec<u8>) is dropped here, freeing the raw bytes before the
+        // next sequence arrives.
+    }
+
+    /// Finalize: sort buckets, build the per-bucket hash backend, attach to
+    /// the index, and return it.
+    pub fn finish(mut self) -> Index {
+        #[cfg(feature = "parallel")]
+        self.buckets.par_iter_mut().for_each(|b| {
+            if !b.is_empty() { b.sort_unstable(); }
+        });
+        #[cfg(not(feature = "parallel"))]
+        for b in self.buckets.iter_mut() {
+            if !b.is_empty() { b.sort_unstable(); }
+        }
+
+        self.idx.backend = LookupBackend::BucketHash(
+            super::index_bucket::BucketHashLookup::build(self.bucket_bits, &mut self.buckets, self.max_occ)
+        );
+        self.idx.packed_seqs = self.packed;
+        self.idx
+    }
+}
+
 impl Index {
     /// Strip target sequences from index (for --idx-no-seq).
     /// Keeps all metadata (name, len, offset) but clears all sequence data.
@@ -353,11 +497,17 @@ impl Index {
         }
     }
 
-    /// Build an index from target sequences.
+    /// Build an index from target sequences. Convenience wrapper around
+    /// Build an index from target sequences. Uses parallel pack + sketch on
+    /// CHUNK_SIZE-sequence batches (rayon-fanned when the `parallel` feature
+    /// is enabled), which is materially faster than the sequential
+    /// [`IndexBuilder`] for multi-sequence references — that path exists for
+    /// WASM streaming, where we can't hold the full `Vec<(String, Vec<u8>)>`
+    /// in memory at once.
     ///
-    /// Note: `max_occ` is a hard cap to filter extremely repetitive minimizers during index
-    /// construction. The `mid_occ` threshold (calculated via `cal_mid_occ`) should be applied
-    /// at query time, not during index building.
+    /// `max_occ` is a hard cap to filter extremely repetitive minimizers
+    /// during index construction. The `mid_occ` threshold (calculated via
+    /// `cal_mid_occ`) should be applied at query time, not during build.
     pub fn build(
         seqs: Vec<(String, Vec<u8>)>,
         w: usize,
@@ -376,30 +526,12 @@ impl Index {
         };
 
         let mut offset = 0usize;
-        // Batched parallel pack + sketch. Sequences are processed in parallel
-        // batches: each batch packs and sketches its sequences, then the results
-        // are merged sequentially and the ASCII data is dropped. This gives us
-        // parallelism while never holding all sequences in memory at once.
-
-        static NT4_TABLE: [u32; 256] = {
-            let mut t = [4u32; 256];
-            t[b'A' as usize] = 0; t[b'a' as usize] = 0;
-            t[b'C' as usize] = 1; t[b'c' as usize] = 1;
-            t[b'G' as usize] = 2; t[b'g' as usize] = 2;
-            t[b'T' as usize] = 3; t[b't' as usize] = 3;
-            t
-        };
 
         // Collect metadata and total length.
         let mut seq_data: Vec<Vec<u8>> = Vec::with_capacity(seqs.len());
         for (name, seq_bytes) in seqs {
             let len = seq_bytes.len();
-            idx.seqs.push(TargetSequence {
-                name,
-                len,
-                offset: offset as u64,
-                is_alt: false,
-            });
+            idx.seqs.push(TargetSequence { name, len, offset: offset as u64, is_alt: false });
             offset += len;
             seq_data.push(seq_bytes);
         }
@@ -412,23 +544,14 @@ impl Index {
         let mut packed = vec![0u32; n_u32];
         let mut buckets: Vec<Vec<(u64, u64)>> = vec![Vec::new(); n_buckets];
 
-        // Process sequences in chunks: drain a chunk, pack sequentially, parallel
-        // sketch into per-sequence minimizer Vecs, sequential distribute into
-        // global buckets, drop chunk. This bounds peak memory to roughly
-        // chunk_seqs + chunk_minimizers + global_buckets (rather than holding
-        // all sequences and all per-thread bucket arrays simultaneously).
-        //
-        // Output equivalence: sketch_sequence is deterministic given (seq, rid, w, k),
-        // so the set of (hash, y) pairs in each bucket is the same as sequential.
-        // y = (rid << 32) | (pos << 1) | strand makes every pair unique, so the
-        // subsequent sort_unstable() yields a fully deterministic order independent
-        // of input order. The bit-identical .mmi file is verified in tests.
+        // Process sequences in chunks: drain a chunk, pack sequentially,
+        // parallel-sketch into per-sequence minimizer Vecs, sequential
+        // distribute into global buckets, drop the chunk. Bounds peak memory
+        // to roughly chunk_seqs + chunk_minimizers + global_buckets.
         const CHUNK_SIZE: usize = 32;
         let mut rid_offset = 0usize;
         while !seq_data.is_empty() {
             let take_n = CHUNK_SIZE.min(seq_data.len());
-            // Drain chunk; uppercase in-place for HPC (homopolymer detection in
-            // sketch compares raw bytes, so case must be consistent with pack).
             let chunk: Vec<Vec<u8>> = seq_data.drain(..take_n).map(|mut s| {
                 if is_hpc {
                     for b in s.iter_mut() { *b = b.to_ascii_uppercase(); }
@@ -449,7 +572,7 @@ impl Index {
 
             // Parallel-sketch each sequence into its own minimizer Vec.
             #[cfg(feature = "parallel")]
-            let chunk_minis: Vec<Vec<Minimizer>> = chunk.par_iter().enumerate()
+            let chunk_minis: Vec<Vec<crate::align::sketch::Minimizer>> = chunk.par_iter().enumerate()
                 .map(|(i, ascii)| {
                     let rid = rid_offset + i;
                     let len = idx.seqs[rid].len;
@@ -459,7 +582,7 @@ impl Index {
                 })
                 .collect();
             #[cfg(not(feature = "parallel"))]
-            let chunk_minis: Vec<Vec<Minimizer>> = chunk.iter().enumerate()
+            let chunk_minis: Vec<Vec<crate::align::sketch::Minimizer>> = chunk.iter().enumerate()
                 .map(|(i, ascii)| {
                     let rid = rid_offset + i;
                     let len = idx.seqs[rid].len;
@@ -469,9 +592,7 @@ impl Index {
                 })
                 .collect();
 
-            // Distribute minimizers into global buckets sequentially. Order of
-            // pushes doesn't affect the sorted bucket output because all (hash, y)
-            // pairs are unique.
+            // Distribute minimizers into global buckets sequentially.
             for minis in chunk_minis {
                 for m in minis {
                     let hash = m.x >> 8;
@@ -480,14 +601,11 @@ impl Index {
             }
 
             rid_offset += take_n;
-            // chunk dropped here — sequences freed before next chunk
         }
         drop(seq_data);
         idx.packed_seqs = packed;
 
         // Parallel bucket post-processing: sort each bucket independently.
-        // 1024 (or however many buckets) sort+compact jobs run across all
-        // rayon threads — the bulk of build parallelism lives here.
         #[cfg(feature = "parallel")]
         buckets.par_iter_mut().for_each(|b| {
             if !b.is_empty() { b.sort_unstable(); }
@@ -497,12 +615,9 @@ impl Index {
             if !b.is_empty() { b.sort_unstable(); }
         }
 
-        // Build per-bucket hash tables. Each bucket is processed and freed
-        // independently, keeping peak memory low.
         idx.backend = LookupBackend::BucketHash(
             super::index_bucket::BucketHashLookup::build(bucket_bits, &mut buckets, max_occ)
         );
-
         idx
     }
 

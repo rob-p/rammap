@@ -75,12 +75,57 @@ configurable in the demo UI (defaults to 4, max = system threads via `navigator.
 
 ---
 
+## Reference size ceiling
+
+The browser-WASM demo can handle FASTA references up to roughly **1.5 GB of
+bases** (or ~0.5 GB compressed for gzipped input). Above that, the index is
+too large to fit in WebAssembly's 4 GB linear-memory cap and the build fails
+partway through with a trap.
+
+The steady-state memory needed to index an N-base reference is:
+
+| Component | Size |
+|---|---|
+| Packed 4-bit reference | N / 2 bytes |
+| Bucket entries (`~N/w × 16 B` for w=10 default) | ~1.6 × N bytes |
+| Working memory | ~0.2 GB |
+
+For hs1 (T2T human, 3.1 Gb): packed ≈ 1.5 GB + buckets ≈ 2.6 GB ≈ 4.3 GB of
+index, before counting any working memory. That exceeds the WASM32 ceiling
+even under perfect allocation. Use the native rammap CLI for genome-scale
+references.
+
+The demo's drop-zone surfaces a warning when a reference file is dropped that
+will likely exceed the ceiling.
+
+---
+
 ## API Reference
+
+### `AlignSession` (streaming, recommended)
+
+Class-based API for multi-GB inputs. Bytes flow through streaming FASTA/FASTQ
+parsers; the reference is packed-and-dropped as records complete, queries are
+aligned one read at a time. Peak WASM memory stays bounded regardless of
+total input size — though still subject to the 4 GB linear-memory cap (see
+above).
+
+```js
+const session = new AlignSession(preset, output_sam, output_cigar);
+session.reserve_ref_bases(BigInt(uncompressed_ref_bytes));  // optional hint
+for await (const chunk of streamChunks) session.append_ref(chunk);
+session.finalize_ref();
+let out = '';
+for await (const chunk of queryChunks) out += session.append_query(chunk);
+out += session.finalize();   // trailing output + "---LOG---\n<log>"
+```
 
 ### `align_wasm_full(target, query, preset, output_sam, output_cigar) → String`
 
-Main entry point. Builds index from `target` (FASTA text), aligns all sequences
-in `query` (FASTA or FASTQ text), returns results.
+Single-call entry point. Builds index from `target` (FASTA text), aligns all
+sequences in `query` (FASTA or FASTQ text), returns results. Constrained by
+V8's ~512 MB max-string length on both inputs — prefer `AlignSession` for
+anything beyond ~100 MB.
 
 **Parameters:**
 - `target`: FASTA reference text (multi-sequence supported)
@@ -314,8 +359,12 @@ to scalar, and total slowdown increases to ~1.84x.
   headers. Embedding in iframes requires the parent page to also send these headers.
 - **Memory**: WASM linear memory grows on demand but has a configured maximum (4 GB
   for threaded builds). Large reference genomes may approach this limit.
-- **No gzip support**: The WASM build does not support gzipped input files. Decompress
-  before loading.
+- **Gzip is decompressed on the JS side**: The WASM module itself takes raw bytes,
+  but the demo's worker (`web/worker.js`) detects the gzip magic header and pipes
+  the file through `DecompressionStream('gzip')` before chunking it into
+  `AlignSession.append_ref` / `append_query`. So `.fa.gz` / `.fq.gz` files load
+  end-to-end without an explicit decompress step. WASI consumers wanting the same
+  behavior need to wire it up themselves.
 - **Index serialization**: The WASM build does not support loading `.mmi` or `.rmmi`
   index files. Indices are built from FASTA at runtime.
 - **Startup overhead**: wasmtime JIT compilation adds ~100ms startup time. Browser

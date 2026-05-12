@@ -1,9 +1,10 @@
 
 use wasm_bindgen::prelude::*;
 use crate::align::map::{MapOptions, MapContext, AlignFlags};
-use crate::align::index::Index;
+use crate::align::index::{Index, IndexBuilder};
 use crate::align::pipeline::{align_and_format_query, OutputConfig, ReadInfo};
 use crate::align::extend::AlignmentContext;
+use crate::fasta::{FastaStreamer, FastqStreamer};
 
 /// Re-export rayon thread pool initializer for WASM multithreading.
 /// JS must call `await initThreadPool(n)` before any parallel work.
@@ -15,11 +16,40 @@ extern "C" {
     /// Log callback — sends progress messages to the JS host.
     #[wasm_bindgen(js_namespace = console)]
     fn log(s: &str);
+
+    #[wasm_bindgen(js_namespace = console)]
+    fn error(s: &str);
 }
 
 /// Log to both the JS console and our callback.
 fn wasm_log(s: &str) {
     log(s);
+}
+
+/// Forward Rust panics to console.error with full payload (location + message).
+/// Without this, panics surface to JS as the opaque "unreachable executed"
+/// trap and there is no way to tell what actually went wrong.
+#[wasm_bindgen(start)]
+pub fn _set_panic_hook() {
+    use std::sync::Once;
+    static SET: Once = Once::new();
+    SET.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let mut msg = String::from("PANIC: ");
+            if let Some(loc) = info.location() {
+                msg.push_str(&format!("[{}:{}:{}] ", loc.file(), loc.line(), loc.column()));
+            }
+            let payload = info.payload();
+            if let Some(s) = payload.downcast_ref::<&str>() {
+                msg.push_str(s);
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                msg.push_str(s);
+            } else {
+                msg.push_str("<non-string payload>");
+            }
+            error(&msg);
+        }));
+    });
 }
 
 /// Apply a named preset (e.g. `map-ont`, `lr:hq`, `sr`, `splice`) to
@@ -284,6 +314,240 @@ pub fn force_align_wasm(tseq: &str, qseq: &str) -> String {
 
     fmt_cigar(&aln_result.cigar_ops, false)
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Streaming session API for multi-GB inputs.
+//
+// `align_wasm_full` requires the caller to materialize the entire reference
+// and query text as JS strings, which breaks down past V8's ~512 MB string
+// cap. `AlignSession` instead accepts arbitrary byte chunks: bytes flow
+// through the streaming FASTA / FASTQ parsers, each completed record is
+// packed-and-dropped (ref) or aligned-and-dropped (query), so peak WASM
+// linear memory stays bounded regardless of total input size.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Streaming alignment session. Construct, push ref chunks, finalize the
+/// reference, push query chunks (each chunk emits its own output prefix),
+/// then `finalize` to get the trailing log.
+#[wasm_bindgen]
+pub struct AlignSession {
+    // Config
+    preset: String,
+    output_sam: bool,
+    output_cigar: bool,
+    opt: MapOptions,
+    out_cfg: OutputConfig,
+    k: usize,
+    w: usize,
+    is_hpc: bool,
+
+    // Accumulated log (joined with output at the end).
+    log_buf: String,
+
+    // Ref-build phase (Some until `finalize_ref` is called).
+    builder: Option<IndexBuilder>,
+    ref_parser: Option<FastaStreamer>,
+    t_ref_start: Option<web_time::Instant>,
+
+    // Align phase (Some after `finalize_ref`).
+    idx: Option<Index>,
+    query_parser: Option<FastqStreamer>,
+    ctx: Option<AlignmentContext>,
+    map_ctx: Option<MapContext>,
+    t_align_start: Option<web_time::Instant>,
+    n_aligned: usize,
+    n_queries: usize,
+}
+
+#[wasm_bindgen]
+impl AlignSession {
+    /// Create a new session. After construction, push ref bytes via
+    /// `append_ref`, then call `finalize_ref`, then push query bytes via
+    /// `append_query`, then call `finalize`.
+    #[wasm_bindgen(constructor)]
+    pub fn new(preset: &str, output_sam: bool, output_cigar: bool) -> Self {
+        let mut k = 15usize;
+        let mut w = 10usize;
+        let mut is_hpc = false;
+        let mut opt = MapOptions::default();
+        apply_preset_wasm(&mut opt, &mut k, &mut w, &mut is_hpc, preset);
+        if output_cigar || output_sam {
+            opt.flags.insert(AlignFlags::OUT_CIGAR);
+        }
+        let out_cfg = OutputConfig {
+            do_cigar: output_cigar,
+            do_cs: false,
+            cs_long: false,
+            do_md: false,
+            do_ds: false,
+            eqx: false,
+            output_sam,
+            rg_id: None,
+            split_mode: false,
+        };
+        let mut log_buf = String::new();
+        log_buf.push_str(&format!("[*] Preset: {} (k={}, w={})\n", preset, k, w));
+
+        Self {
+            preset: preset.to_string(),
+            output_sam,
+            output_cigar,
+            opt,
+            out_cfg,
+            k, w, is_hpc,
+            log_buf,
+            builder: Some(IndexBuilder::new(w, k, is_hpc, 50000)),
+            ref_parser: Some(FastaStreamer::new()),
+            t_ref_start: Some(web_time::Instant::now()),
+            idx: None,
+            query_parser: None,
+            ctx: None,
+            map_ctx: None,
+            t_align_start: None,
+            n_aligned: 0,
+            n_queries: 0,
+        }
+    }
+
+    /// Optional pre-allocation hint for the packed reference buffer. Pass an
+    /// upper-bound estimate of the total reference bases (e.g. the
+    /// uncompressed file size). Avoids the doubling realloc that can briefly
+    /// use 3× the final packed-buffer size on multi-GB inputs.
+    pub fn reserve_ref_bases(&mut self, expected_total: u64) -> Result<(), JsValue> {
+        let builder = self.builder.as_mut()
+            .ok_or_else(|| JsValue::from_str("reserve_ref_bases called after finalize_ref"))?;
+        builder.reserve_bases(expected_total as usize);
+        Ok(())
+    }
+
+    /// Push a chunk of reference bytes. Completed FASTA records get packed
+    /// into the index immediately and their raw bytes are dropped. Safe to
+    /// call with chunks of any size, including byte-by-byte.
+    pub fn append_ref(&mut self, chunk: &[u8]) -> Result<(), JsValue> {
+        let parser = self.ref_parser.as_mut()
+            .ok_or_else(|| JsValue::from_str("append_ref called after finalize_ref"))?;
+        let builder = self.builder.as_mut()
+            .ok_or_else(|| JsValue::from_str("append_ref called after finalize_ref"))?;
+        parser.push(chunk);
+        while let Some((name, seq)) = parser.next_record() {
+            builder.add_sequence(name, seq);
+        }
+        Ok(())
+    }
+
+    /// Flush the in-flight ref record (if any), build the index, and
+    /// transition to the alignment phase.
+    pub fn finalize_ref(&mut self) -> Result<(), JsValue> {
+        let mut parser = self.ref_parser.take()
+            .ok_or_else(|| JsValue::from_str("finalize_ref called twice"))?;
+        let mut builder = self.builder.take()
+            .ok_or_else(|| JsValue::from_str("finalize_ref called twice"))?;
+        parser.finalize();
+        while let Some((name, seq)) = parser.next_record() {
+            builder.add_sequence(name, seq);
+        }
+
+        let n_seqs = builder.num_sequences();
+        let total_bases = builder.total_bases();
+        if n_seqs == 0 {
+            return Err(JsValue::from_str("No reference sequences found"));
+        }
+        let t0 = self.t_ref_start.take().unwrap_or_else(web_time::Instant::now);
+        self.log_buf.push_str(&format!(
+            "[*] Reference: {} sequence(s), {} bases\n", n_seqs, total_bases));
+
+        let idx = builder.finish();
+        self.opt.seeding.mid_occ = idx.cal_mid_occ(2e-4, 10, 10000);
+        self.log_buf.push_str(&format!(
+            "[*] Index built in {:.3}s (mid_occ={})\n",
+            t0.elapsed().as_secs_f64(), self.opt.seeding.mid_occ));
+
+        self.idx = Some(idx);
+        self.query_parser = Some(FastqStreamer::new());
+        self.ctx = Some(AlignmentContext::new());
+        self.map_ctx = Some(MapContext::new());
+        self.t_align_start = Some(web_time::Instant::now());
+        Ok(())
+    }
+
+    /// Push a chunk of FASTQ query bytes. Each completed read is aligned
+    /// immediately against the prebuilt index; returns the concatenated PAF
+    /// (or SAM) output produced by reads completed in this chunk.
+    pub fn append_query(&mut self, chunk: &[u8]) -> Result<String, JsValue> {
+        let parser = self.query_parser.as_mut()
+            .ok_or_else(|| JsValue::from_str("append_query called before finalize_ref"))?;
+        let idx = self.idx.as_ref()
+            .ok_or_else(|| JsValue::from_str("append_query called before finalize_ref"))?;
+        let ctx = self.ctx.as_mut().unwrap();
+        let map_ctx = self.map_ctx.as_mut().unwrap();
+
+        parser.push(chunk);
+        let mut out = String::new();
+        while let Some((qname, qseq)) = parser.next_record() {
+            self.n_queries += 1;
+            let ri = ReadInfo {
+                qname: &qname,
+                qseq: &qseq,
+                qual: None, comment: None, n_seg: 1, seg_idx: 0,
+            };
+            let res = align_and_format_query(
+                &self.opt, idx, &ri, ctx, map_ctx, None, None, &self.out_cfg,
+            );
+            if !res.0.is_empty() {
+                out.push_str(&res.0);
+                self.n_aligned += 1;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Flush any trailing FASTQ record and return the final log section.
+    /// The log block is prefixed with "---LOG---\n" so it concatenates
+    /// cleanly with the accumulated PAF/SAM output on the JS side.
+    pub fn finalize(&mut self) -> Result<String, JsValue> {
+        let parser = self.query_parser.as_mut()
+            .ok_or_else(|| JsValue::from_str("finalize called before finalize_ref"))?;
+        let idx = self.idx.as_ref().unwrap();
+        let ctx = self.ctx.as_mut().unwrap();
+        let map_ctx = self.map_ctx.as_mut().unwrap();
+        parser.finalize();
+        let mut trailing_out = String::new();
+        while let Some((qname, qseq)) = parser.next_record() {
+            self.n_queries += 1;
+            let ri = ReadInfo {
+                qname: &qname,
+                qseq: &qseq,
+                qual: None, comment: None, n_seg: 1, seg_idx: 0,
+            };
+            let res = align_and_format_query(
+                &self.opt, idx, &ri, ctx, map_ctx, None, None, &self.out_cfg,
+            );
+            if !res.0.is_empty() {
+                trailing_out.push_str(&res.0);
+                self.n_aligned += 1;
+            }
+        }
+
+        if let Some(t0) = self.t_align_start.take() {
+            let secs = t0.elapsed().as_secs_f64().max(0.001);
+            self.log_buf.push_str(&format!(
+                "[*] Aligned {} reads ({} with hits) in {:.3}s ({:.0} reads/sec)\n",
+                self.n_queries, self.n_aligned, secs,
+                self.n_queries as f64 / secs));
+        }
+
+        let log = std::mem::take(&mut self.log_buf);
+        Ok(format!("{}---LOG---\n{}", trailing_out, log))
+    }
+}
+
+// Silence unused-field warnings (preset/output_sam/output_cigar are surfaced
+// via the constructor but not read again in the implementation; keeping them
+// makes the struct self-describing in debug dumps).
+#[allow(dead_code)]
+const _AVOID_UNUSED: fn(&AlignSession) = |s: &AlignSession| {
+    let _ = (&s.preset, s.output_sam, s.output_cigar, s.is_hpc, s.w, s.k);
+};
 
 // ==================== WASM Tests ====================
 #[cfg(target_arch = "wasm32")]
