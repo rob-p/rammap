@@ -1,10 +1,9 @@
 # rammap
 
-A pure-Rust extensible sequence aligner and mapper intended to mirror the interface and produce identical output to [minimap2](https://github.com/lh3/minimap2).
+A pure-Rust extensible sequence aligner and mapper mirroring the interface and producing identical output to [minimap2](https://github.com/lh3/minimap2).
 
-Supports all major minimap2 presets (map-ont, map-hifi, sr, splice, asm, ava)
-with full CIGAR, CS/MD tags, SAM, and PAF output. SIMD-optimized DP kernels
-(NEON, SSE2, SSE4.1, AVX2, AVX512BW, WASM v128) with scalar fallback.
+Supports all minimap2 presets (map-ont, map-hifi, sr, splice, asm, ava) with full CIGAR, CS/MD tags, SAM, and PAF output. SIMD-optimized DP kernels
+(NEON, SSE2, SSE4.1, AVX2, AVX512BW, WASM v128) with scalar memory safe fallback.
 
 ## Quick Start (CLI)
 
@@ -19,15 +18,20 @@ cargo build --release
 | Preset | Data type |
 |--------|-----------|
 | `map-ont` | Oxford Nanopore reads |
-| `map-pb` | PacBio CLR reads |
+| `map-pb` | PacBio CLR reads (HPC seeds) |
 | `map-hifi` | PacBio HiFi reads |
+| `map-iclr` | Illumina Complete Long Reads |
 | `lr:hq` | Accurate long reads |
+| `lr:hqae` | HQ long-read assembly eval |
 | `sr` | Short reads (Illumina) |
 | `splice` | Long-read RNA-seq |
 | `splice:hq` | High-quality RNA-seq |
-| `cdna` | cDNA-seq |
-| `asm5` / `asm10` / `asm20` | Assembly-to-reference (1-5% / 10% / 20% divergence) |
+| `splice:sr` | Spliced short RNA-seq |
+| `cdna` | cDNA / splice alias |
+| `asm5` / `asm10` / `asm20` | Assembly-to-reference (~0.1% / 1% / 5% divergence) |
 | `ava-ont` / `ava-pb` | All-vs-all overlap |
+
+Run `rammap -x --help` for the full list of accepted preset names and aliases.
 
 ### aarch64 (including macOS)
 
@@ -49,6 +53,8 @@ compatible with [minimap2-rs](https://github.com/jguhlin/minimap2-rs).
 [dependencies]
 rammap = { path = "../rammap", default-features = false, features = ["parallel"] }
 ```
+
+Available features: `parallel` (rayon-based threading), `cli` (CLI deps — only needed for the binary), `wasm-threads` (browser-side rayon for WASM builds), `jemalloc` / `mimalloc` (opt-in global allocators; off by default).
 
 ### Example
 

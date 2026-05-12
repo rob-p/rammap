@@ -2,9 +2,9 @@
 
 **rammap** is a pure-Rust minimap2-compatible sequence aligner producing byte-identical output via the same algorithms. It supports all major minimap2 presets (map-ont, map-hifi, sr, splice, asm, ava) with full CIGAR, CS/MD/DS tag, SAM, and PAF output.
 
-Standalone crate with both `src/lib.rs` (library) and `src/main.rs` (binary). 30 Rust source files, ~28K lines total. The alignment module is ~24K lines across 24 files; the FASTA/FASTQ reader is ~650 lines.
+Standalone crate with both `src/lib.rs` (library) and `src/main.rs` (binary). The alignment engine lives under `src/align/`; FASTA/FASTQ I/O under `src/fasta/`.
 
-**Key dependencies**: rayon (parallelism), clap (CLI), serde/bincode (index serialization), memmap2 (FASTA mmap), flate2 (gzip), wasm-bindgen (WASM support).
+**Key dependencies**: rayon (parallelism, optional), clap (CLI, optional), serde + bincode (index serialization), hashbrown (per-bucket hash tables), flate2 (gzip), wasm-bindgen + wasm-bindgen-rayon (WASM support, latter optional).
 
 **Build profile**: `opt-level=3`, `lto="fat"`, `codegen-units=1`, `target-cpu=native` via `.cargo/config.toml`.
 
@@ -32,46 +32,49 @@ Standalone crate with both `src/lib.rs` (library) and `src/main.rs` (binary). 30
 
 ```
 src/
-  main.rs             (1662)  # Binary entry: CLI parse + alignment orchestration
-  lib.rs                 (7)  # Library exports: align, fasta, api
-  api.rs               (915)  # Programmatic API entry points
+  main.rs             # Binary entry: CLI parse + alignment orchestration
+  lib.rs              # Library exports: align, fasta, api
+  api.rs              # Programmatic API entry points
 
-  align/                       # alignment engine (~24K lines)
-    mod.rs               (50)  # Module declarations
-    sketch.rs           (332)  # Minimizer generation (rolling hash, windowing)
-    sort.rs             (349)  # MSD radix sort (parallel two-level for index build)
-    index.rs            (553)  # Reference index: build, save, load (RMMI/MMI formats)
-    index_bucket.rs     (314)  # Per-bucket hash table backend
-    seed.rs             (555)  # Seed collection: index lookup, occurrence filtering, heap mode
-    map.rs             (1775)  # Mapping orchestration: MapOptions, MapContext, map_query()
-    chain.rs            (471)  # Standard DP chaining (O(n^2) with skip limits)
-    chain_simd.rs      (1289)  # SIMD chaining: AVX2 (8-wide) + NEON (4-wide)
-    chain_rmq.rs        (770)  # RMQ-accelerated chaining (arena treap, O(log n))
-    chain_simple.rs     (215)  # Greedy chain scoring (simple/fast)
-    filter.rs           (375)  # Parent assignment + secondary filtering
-    extend.rs          (2117)  # Anchor extension, gap-fill, CIGAR generation, CS/MD/DS formatters
+  align/              # Alignment engine
+    mod.rs            # Module declarations
+    sketch.rs         # Minimizer generation (rolling hash, windowing)
+    sort.rs           # MSD radix sort (parallel two-level for index build)
+    index.rs          # Reference index: build (Index::build, IndexBuilder), save, load
+    index_bucket.rs   # Per-bucket hash table backend
+    seed.rs           # Seed collection: index lookup, occurrence filtering, heap mode
+    map.rs            # Mapping orchestration: MapOptions, MapContext, map_query()
+    chain.rs          # Standard DP chaining (O(n^2) with skip limits)
+    chain_simd.rs     # SIMD chaining: AVX2 (8-wide) + NEON (4-wide) + WASM SIMD128
+    chain_rmq.rs      # RMQ-accelerated chaining (arena treap, O(log n))
+    chain_simple.rs   # Greedy chain scoring (simple/fast)
+    filter.rs         # Parent assignment + secondary filtering
+    extend.rs         # Anchor extension, gap-fill, CIGAR generation, CS/MD/DS formatters
 
-    dp/                        # SIMD DP engine (~10.7K lines, split by algorithm)
-      mod.rs             (832)  # Re-exports public API, tests (SIMD concordance)
-      common.rs          (827)  # Types (DpResult), constants, flags, memory mgmt, traceback
-      single.rs         (1917)  # Single-affine gap: SSE2/4.1/AVX2/AVX512/NEON/WASM/scalar
-      dual.rs           (3069)  # Dual-affine gap: SSE2/4.1/AVX2/AVX512/NEON/WASM/scalar
-      splice.rs         (3450)  # Splice-aware: SSE2/4.1/AVX2/AVX512/NEON/WASM/scalar
-      lw.rs              (612)  # Lightweight i16 Smith-Waterman + global NW alignment
+    dp/               # SIMD DP engine (split by algorithm)
+      mod.rs          # Re-exports public API, tests (SIMD concordance)
+      common.rs       # Types (DpResult), constants, flags, memory mgmt, traceback
+      single.rs       # Single-affine gap: SSE2/4.1/AVX2/AVX512/NEON/WASM/scalar
+      dual.rs         # Dual-affine gap: SSE2/4.1/AVX2/AVX512/NEON/WASM/scalar
+      splice.rs       # Splice-aware: SSE2/4.1/AVX2/AVX512/NEON/WASM/scalar
+      lw.rs           # Lightweight i16 Smith-Waterman + global NW alignment
 
-    pipeline.rs        (2649)  # End-to-end pipeline: process_query, format_output, MAPQ, PE
-    pair.rs             (250)  # Paired-end logic (concordant pairing, PE MAPQ)
-    junc.rs             (295)  # Junction annotation scoring (BED/SPSC for splice)
-    jump.rs             (522)  # Jump splice extension (BED12 junction rescue)
-    split.rs            (418)  # Split index: temp file I/O, multi-part merge
-    align_simple.rs     (339)  # Simple alignment kernels
-    stats.rs             (39)  # AlignmentStats timing struct
-    wasm_lib.rs         (217)  # wasm-bindgen entry point
+    pipeline.rs       # End-to-end pipeline: process_query, format_output, MAPQ, PE
+    pair.rs           # Paired-end logic (concordant pairing, PE MAPQ)
+    junc.rs           # Junction annotation scoring (BED/SPSC for splice)
+    jump.rs           # Jump splice extension (BED12 junction rescue)
+    split.rs          # Split index: temp file I/O, multi-part merge
+    align_simple.rs   # Simple NW alignment kernel (alternative Aligner impl)
+    stats.rs          # AlignmentStats timing struct
+    wasm_lib.rs       # wasm-bindgen entry points (align_wasm_full, AlignSession)
+    syncmer.rs        # Open-syncmer sketcher (alternative Sketcher impl)
+    strobemer.rs      # Randstrobe sketcher (alternative Sketcher impl)
 
-  fasta/                       # Custom FASTA/FASTQ I/O (faster than noodles for raw parsing)
-    mod.rs                (7)  # Module declarations
-    reader.rs           (558)  # Streaming parser (zero-copy RefRecord)
-    record.rs            (83)  # Record/RefRecord types
+  fasta/              # Custom FASTA/FASTQ I/O
+    mod.rs            # Module declarations
+    reader.rs         # Block / file-based parser (zero-copy RefRecord, gzip auto-detect)
+    record.rs         # Record / RefRecord types
+    stream.rs         # Chunk-fed streaming FASTA/FASTQ parsers (FastaStreamer, FastqStreamer)
 ```
 
 ---
@@ -238,15 +241,17 @@ merge_split_results(prefix, n_parts, opt, mi)
 
 **Key types**:
 - `Index` — `{kmer_size, window_size, homopolymer_compressed, index (part#), seqs: Vec<TargetSequence>, backend: LookupBackend, packed_seqs: Vec<u32>}`
+- `IndexBuilder` — Incremental, streaming-friendly builder. Pack + sketch one sequence at a time, drop the bytes after — designed for WASM where the caller can't materialize the full `Vec<(String, Vec<u8>)>` of a multi-GB reference.
 - `TargetSequence` — `{name, len, offset, is_alt}` (metadata only; sequence data in packed\_seqs)
 - `SeedLookup` trait — `get()`, `get_range()`, `get_by_range()`, `occurrence_counts()`, `is_empty()`
 - `LookupBackend` enum — currently `BucketHash(BucketHashLookup)`, extensible for future backends
 - `BucketHashLookup` (index\_bucket.rs) — per-bucket open-addressing hash tables with shared flat positions array. Each bucket maps hash suffixes to (offset, count) ranges.
 
 **Key methods**:
-- `Index::build(seqs, w, k, is_hpc) -> Self` — Fused per-sequence pack+sketch (sequential, dropping each sequence's ASCII immediately), parallel bucket sort, sequential per-bucket hash table build
+- `Index::build(seqs, w, k, is_hpc, max_occ) -> Self` — Bulk build path used by the native CLI. Sequences are processed in 32-sequence chunks: pack sequentially (adjacent seqs may share boundary `u32`s), sketch each chunk in parallel via rayon, distribute minimizers into global buckets, drop the chunk. Buckets are then sorted in parallel and consumed one-at-a-time into the per-bucket hash backend.
+- `IndexBuilder::new(w, k, is_hpc, max_occ)` / `add_sequence(name, seq)` / `reserve_bases(n)` / `finish() -> Index` — Streaming alternative. Each `add_sequence` packs into the global buffer, sketches, distributes to buckets, and drops the input bytes before the next call. Sequential (no parallel sketching), so slower than `Index::build` on multi-sequence references — used by the WASM `AlignSession` to keep peak memory bounded.
 - `Index::save(path)` / `save_part(writer)` — Serialize (RMMI format with magic prefix)
-- `Index::load(path)` / `load_part(reader)` — Detect format (RMMI, MMI v2, old bincode)
+- `Index::load(path)` / `load_part(reader)` — Detect format (RMMI, MMI v2, old bincode fallback)
 - `Index::load_minimap2(reader)` — Read minimap2 .mmi format, constructing `BucketHashLookup` directly from per-bucket hash tables
 - `Index::get(hash)` / `get_range(hash)` / `get_by_range(range)` — Delegated to backend
 - `Index::cal_mid_occ(frac, min, max) -> usize` — Compute occurrence threshold via backend's `occurrence_counts()`
@@ -255,7 +260,9 @@ merge_split_results(prefix, n_parts, opt, mi)
 
 **Lookup**: Per-bucket hash table indexed by `hash & mask` (low bits), then open-addressing probe for `hash >> bucket_bits` (high bits). O(1) average case.
 
-**Build memory model**: Sequential sketching processes one reference sequence at a time, dropping ASCII data immediately after packing + sketching. Bucket Vecs grow incrementally during sketch, then are sorted in parallel and consumed one-at-a-time during hash table build. Peak memory ≈ max(buckets, positions + hash tables) — never both simultaneously.
+**Build memory model (`Index::build`)**: Chunked pack + sketch processes 32 sequences at a time; the 32-sequence chunk is the only ASCII held in memory beyond what's been packed. Bucket `Vec`s grow incrementally as minimizers are distributed, then are sorted in parallel and consumed one-at-a-time during hash table build. Peak memory ≈ max(in-flight chunk + buckets, positions + hash tables).
+
+**Build memory model (`IndexBuilder`)**: Same shape, but one sequence in flight at a time instead of 32, and no rayon parallelism. The streaming caller drives the loop — bytes can come from a chunked file read, a `ReadableStream` reader, etc. Reserve the packed buffer up front via `reserve_bases(expected_total)` if you know the total reference size; avoids the 2-3× allocator transient peak that `Vec::push`-driven growth produces on multi-GB inputs.
 
 ---
 
@@ -377,7 +384,7 @@ score[i] = max(
 
 **Key functions**:
 - `align_anchors(anchors, qseq, tseq, ..., junc_db, rid) -> AlignResult` — Main entry: wrapper for `align_anchors_full()`
-- `align_anchors_full(...)` — Full implementation (~525 lines): left extension → gap-fill loop → right extension → CIGAR finalization. Handles z-drop splitting, inversion detection, splice modes.
+- `align_anchors_full(...)` — Full implementation: left extension → gap-fill loop → right extension → CIGAR finalization. Handles z-drop splitting, inversion detection, splice modes.
 - `trim_and_prepare_anchors(...)` — Anchor trimming, bad-end fixing, coordinate setup
 - `compute_left_boundary(...)` / `compute_right_boundary(...)` — Extension boundary from nearby seeds
 - `finalize_cigar(...)` — CIGAR post-processing: `fix_cigar` + =/X conversion
@@ -397,18 +404,18 @@ score[i] = max(
 
 ---
 
-### dp/ — SIMD Dynamic Programming (~10.7K lines)
+### dp/ — SIMD Dynamic Programming
 
 **Purpose**: SIMD-accelerated banded DP alignment. Three algorithm variants across six platform targets (SSE2, SSE4.1, AVX2, AVX512BW, NEON, WASM SIMD128) plus scalar fallback. Split into sub-modules by algorithm:
 
-| Module | Lines | Contents |
-|--------|------:|---------|
-| `dp/common.rs` | 827 | Types (`DpResult`, `LightweightProfile`), constants, alignment flags, memory management (`AlignedMemory`, `DP_MEM_CACHE`), WASM SIMD compat layer, x86 SIMD helpers, traceback functions |
-| `dp/single.rs` | 1,917 | Single-affine gap: `cost = q + k*e`. All SIMD variants + scalar + dispatch |
-| `dp/dual.rs` | 3,069 | Dual-affine gap: `cost = min(q+k*e, q2+k*e2)`. All SIMD variants + scalar + dispatch |
-| `dp/splice.rs` | 3,450 | Splice-aware: GT-AG junction detection + bonus. All SIMD variants + scalar + dispatch |
-| `dp/lw.rs` | 612 | Lightweight i16 Smith-Waterman (no traceback) + global NW alignment |
-| `dp/mod.rs` | 832 | Module declarations, `pub use` re-exports, SIMD concordance tests |
+| Module | Contents |
+|--------|---------|
+| `dp/common.rs` | Types (`DpResult`, `LightweightProfile`), constants, alignment flags, memory management (`AlignedMemory`, `DP_MEM_CACHE`), WASM SIMD compat layer, x86 SIMD helpers, traceback functions |
+| `dp/single.rs` | Single-affine gap: `cost = q + k*e`. All SIMD variants + scalar + dispatch |
+| `dp/dual.rs` | Dual-affine gap: `cost = min(q+k*e, q2+k*e2)`. All SIMD variants + scalar + dispatch |
+| `dp/splice.rs` | Splice-aware: GT-AG junction detection + bonus. All SIMD variants + scalar + dispatch |
+| `dp/lw.rs` | Lightweight i16 Smith-Waterman (no traceback) + global NW alignment |
+| `dp/mod.rs` | Module declarations, `pub use` re-exports, SIMD concordance tests |
 
 Each algorithm module contains all its SIMD variants (SSE2/SSE4.1 via macro, AVX2 macro, AVX512 macro, NEON, WASM) plus scalar fallback — keeping all code for one algorithm together.
 
@@ -460,21 +467,21 @@ Each algorithm module contains all its SIMD variants (SSE2/SSE4.1 via macro, AVX
 **Core pipeline functions**:
 - `align_and_format_query(opt, mi, qseq, qname, qlen, regs, out_cfg, ctx, junc_db, jump_db, split_mode) -> ProcessedQuery` — Single-segment entry: map → align → format
 - `process_query(opt, mi, qseq, qname, qlen, regs, out_cfg, ctx, junc_db, jump_db, split_mode) -> ProcessedQuery` — Core alignment loop calling `align_single_mapping()` per chain
-- `process_query_core(...)` — Orchestrator (~216 lines): alignment loop → `filter_alignment_results()` → `assign_parents_and_select()` → `compute_mapqs()`
+- `process_query_core(...)` — Orchestrator: alignment loop → `filter_alignment_results()` → `assign_parents_and_select()` → `compute_mapqs()`
 - `align_single_mapping(mapping, opt, mi, qseq, qlen, ctx, junc_db) -> AlnResult` — Align one chain: extracts sequences, calls `align_anchors()`, computes CigarStats
 - `align_and_format_pair(opt, mi, segs, names, qlens, junc_db, jump_db, ctx, out_cfg) -> Vec<(String, String)>` — PE entry point
 
 **Post-alignment functions**:
 - `filter_alignment_results(results, recalc_infos, opt)` — Threshold filtering (`min_dp_max`, `min_cnt`, etc.)
-- `assign_parents_and_select(results, recalc_infos, opt, mi, ...)` — Parent assignment + secondary selection + `dp_max` ranking (~253 lines)
+- `assign_parents_and_select(results, recalc_infos, opt, mi, ...)` — Parent assignment + secondary selection + `dp_max` ranking
 - `compute_mapqs(results, mapqs, ...)` — MAPQ calculation (log-odds ratio between top 2 `dp_max` scores)
 - `update_dp_max(dp_max_vals, recalc_infos, qlen, ...)` — Recalculate `dp_max` from CIGAR stats
 - `compute_alignment_score_max(ops, mat, q, e, qseq, tseq, log_gap) -> i32` — Walk CIGAR to find max local score
 
 **Output functions**:
 - `format_output(qname, qlen, results, mapqs, out_cfg, opt, seq_data) -> (String, bool)` — Thin dispatcher calling `format_sam_record` or `format_paf_record`
-- `format_sam_record(buf, result, ...)` — Single SAM record (~211 lines): all columns + tags
-- `format_paf_record(buf, result, ...)` — Single PAF record (~77 lines)
+- `format_sam_record(buf, result, ...)` — Single SAM record: all columns + tags
+- `format_paf_record(buf, result, ...)` — Single PAF record
 - `format_unmapped_record(buf, ...)` — Unmapped read output
 
 **Inversion handling**:
@@ -537,7 +544,7 @@ Each algorithm module contains all its SIMD variants (SSE2/SSE4.1 via macro, AVX
 - `split_read_query(reader, k, rid_shifts) -> Vec<AlnResult>` — Deserialize results
 - `merge_split_results(prefix, n_parts, opt, mi, out, stats)` — Full merge pipeline
 
-**Critical**: `rl:i:0` always in merge output (minimap2 doesn't set `rep_len` during merge). `mid_occ` calculated once from first part only.
+**Critical**: `rl:i:0` always in merge output. `mid_occ` calculated once from first part only.
 
 ---
 
@@ -547,9 +554,19 @@ Each algorithm module contains all its SIMD variants (SSE2/SSE4.1 via macro, AVX
 
 ---
 
-### wasm.rs / wasm\_lib.rs — WebAssembly Support
+### wasm\_lib.rs — WebAssembly Support
 
-`wasm_lib.rs` provides `wasm-bindgen` entry points `align_wasm(target_fasta, query_fasta, output_sam, is_splice) -> String` and `force_align_wasm(...)`. Uses WASM SIMD128 intrinsics when available, falls back to scalar.
+`wasm_lib.rs` exposes the `wasm-bindgen` surface for the browser demo and any other WASM host:
+
+- `align_wasm_full(target_text, query_text, preset, output_sam, output_cigar) -> String` — Single-call entry: build an index from `target_text` (FASTA), align all reads in `query_text` (FASTA/FASTQ auto-detected), return PAF/SAM concatenated with a `---LOG---\n` separator. Constrained by V8's ~512 MB max-string length on each input — for anything larger, use `AlignSession`.
+- `AlignSession` (class) — Streaming entry for multi-GB inputs. `new(preset, output_sam, output_cigar)` → optional `reserve_ref_bases(n)` hint → repeated `append_ref(chunk)` → `finalize_ref()` → repeated `append_query(chunk)` (returns PAF/SAM for reads completed by that chunk) → `finalize()` (returns trailing output + log). Internally drives `FastaStreamer` → `IndexBuilder` for the reference, `FastqStreamer` → per-read alignment for queries; raw bytes are dropped as records complete so peak WASM linear memory stays bounded.
+- `align_wasm(target_fasta, query_fasta, output_sam, is_splice) -> String` — Legacy wrapper around `align_wasm_full` with preset = `splice` or `map-ont`. Kept for backwards compatibility.
+- `force_align_wasm(tseq, qseq) -> String` — Force-align two short sequences via full DP, no seeding/chaining. Returns CIGAR.
+- `init_thread_pool` (re-exported from `wasm_bindgen_rayon`, threaded build only) — JS must `await initThreadPool(n)` before any parallel work runs.
+
+A `#[wasm_bindgen(start)]` panic hook is installed at module init so Rust panics surface to JS as `console.error` with file:line + payload, instead of the opaque "unreachable executed" trap.
+
+Uses WASM SIMD128 intrinsics for DP and chaining when available; falls back to scalar.
 
 ---
 
@@ -966,8 +983,6 @@ Adjustments:
 | aarch64 NEON | 4 predecessors/iter | Compile-time `#[cfg(target_arch = "aarch64")]` |
 | Scalar | 1 predecessor/iter | Fallback |
 
-Note: minimap2 has no SIMD chaining and no AVX2/AVX512 DP kernels (SSE4.1 max).
-
 ### SSE2/SSE4.1 Macro Unification
 
 SSE2 and SSE4.1 share `__m128i` register type and differ in only 3 operations. Each algorithm file (`dp/single.rs`, `dp/dual.rs`, `dp/splice.rs`) defines its own SSE macro:
@@ -1094,7 +1109,7 @@ Only the DP scoring region is zeroed before each alignment. Traceback memory (95
 
 ### Custom FASTA/FASTQ Reader (`src/fasta/reader.rs`)
 
-Zero-copy streaming parser, faster than noodles for raw sequence parsing.
+Zero-copy streaming parser used by the native CLI.
 
 ```rust
 // Zero-copy mode (preferred for alignment):
@@ -1109,11 +1124,17 @@ for record in reader.records() {
 }
 ```
 
-Auto-detects FASTA (`>` header) vs FASTQ (`@` header). Handles multi-line FASTA sequences. Supports gzip-compressed input via flate2.
+Auto-detects FASTA (`>` header) vs FASTQ (`@` header). Handles multi-line FASTA sequences.
 
-### Memory-Mapped FASTA (`src/fasta/reader.rs`)
+`fasta::open(path)` peeks the first two bytes of the file for the gzip magic (`0x1f 0x8b`) and pipes through `MultiGzDecoder` if present — the extension is just informational. If the extension and the content disagree either way, a one-line warning goes to stderr and the content wins.
 
-For reference sequences, `read_fasta_mmap()` uses `memmap2` for zero-copy access to large FASTA files (native platforms only, gated with `cfg(not(wasm32))`).
+`read_fasta(path)` reads the full file into memory via `std::fs::read` for reference loading. Memory mapping was tried and dropped — the parser sequentially scans the whole buffer anyway, so the OS page cache covers the same access pattern without the mmap setup overhead.
+
+### Chunk-fed Streaming Parsers (`src/fasta/stream.rs`)
+
+`FastaStreamer` and `FastqStreamer` are pull-shaped parsers: push raw bytes in arbitrarily-sized chunks via `.push(chunk)`, pop completed `(name, Vec<u8>)` records via `.next_record()`, flush the in-flight record at EOF with `.finalize()`. They do not own the input — bytes accumulate into a small line buffer plus the in-flight sequence's `Vec`, and the completed records are owned hand-offs.
+
+Used by the WASM `AlignSession` so the JS host can stream a multi-GB file (with optional `DecompressionStream('gzip')` decoding upstream) into WASM in 16 MB chunks without ever holding the full uncompressed bytes in a single allocation.
 
 ---
 
@@ -1133,10 +1154,6 @@ Located in `#[cfg(test)] mod tests` blocks within source files. Cover:
 ### WASM Tests
 
 7 WASM tests pass via `wasm-pack test --node -- --lib`.
-
-### Performance Benchmarks
-
-See [performance.md](performance.md) for full benchmark results comparing rammap vs minimap2.
 
 ---
 
@@ -1222,8 +1239,7 @@ Query FASTQ
   → pipeline.rs formatting (safe)
 ```
 
-The scalar DP kernels produce identical results to SIMD (verified by 600/600
-concordance tests against minimap2). The safe traceback (`traceback_single_affine_safe`)
+The scalar DP kernels produce identical results to SIMD. The safe traceback (`traceback_single_affine_safe`)
 uses bounds-checked slice indexing instead of raw pointer arithmetic, with zero
 performance difference at `-O3` (compiler eliminates the bounds checks).
 
