@@ -390,12 +390,26 @@ pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Reader<Box<dyn BufRead + Send
     }
 
     let file = File::open(path.as_ref()).map_err(|e| io::Error::new(e.kind(), format!("Failed to open FASTA/FASTQ '{}': {}", path.as_ref().display(), e)))?;
-    let is_gz = path.as_ref().to_string_lossy().ends_with(".gz");
-    
-    let reader: Box<dyn BufRead + Send> = if is_gz {
-        Box::new(io::BufReader::new(MultiGzDecoder::new(file)))
+
+    // Detect by content (gzip magic 0x1f 0x8b) rather than trusting the extension.
+    // `fill_buf` peeks without consuming, so the magic bytes remain available to
+    // whichever decoder we wire up below. An empty file falls through to plain text.
+    let mut buf_reader = io::BufReader::new(file);
+    let is_gz_content = {
+        let peek = buf_reader.fill_buf()?;
+        peek.len() >= 2 && peek[0] == 0x1f && peek[1] == 0x8b
+    };
+    let ext_says_gz = path.as_ref().to_string_lossy().ends_with(".gz");
+    if ext_says_gz && !is_gz_content {
+        eprintln!("[WARN] '{}' has a .gz extension but is not gzipped; reading as plain text.", path.as_ref().display());
+    } else if !ext_says_gz && is_gz_content {
+        eprintln!("[WARN] '{}' is gzipped but lacks a .gz extension; decompressing.", path.as_ref().display());
+    }
+
+    let reader: Box<dyn BufRead + Send> = if is_gz_content {
+        Box::new(io::BufReader::new(MultiGzDecoder::new(buf_reader)))
     } else {
-        Box::new(io::BufReader::new(file))
+        Box::new(buf_reader)
     };
     Ok(Reader::new(reader))
 }
