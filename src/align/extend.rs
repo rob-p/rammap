@@ -1620,14 +1620,17 @@ pub fn align_anchors(
     }
 
     // SEED_SELF: clamp leftward extension distance to |q-r| of the chain's
-    // FIRST original anchor (pre-trim). Post-trim qs/rs would give a small
-    // non-zero offset that suppresses extension on diagonal self-chains.
+    // FIRST original anchor (pre-trim) in absolute coords. `pre_qs` is in
+    // absolute alignment-space query coords. `pre_rs` (after the earlier
+    // rebase) is in region-relative ref coords; shift by `ref_offset` so
+    // max_ext is computed in matching coord systems.
     let (mut rs0, mut qs0) = (rs0, qs0);
     if !anchors.is_empty() && (anchors[0].y & crate::align::map::SEED_SELF) != 0 {
         let pre_q_span = anchors[0].query_span();
         let pre_qs = anchors[0].query_pos() + 1 - pre_q_span;
         let pre_rs = anchors[0].ref_pos() + 1 - pre_q_span;
-        let max_ext = (pre_qs - pre_rs).unsigned_abs() as i32;
+        let pre_rs_abs = pre_rs + ref_offset;
+        let max_ext = (pre_qs - pre_rs_abs).unsigned_abs() as i32;
         if pre_rs - rs0 > max_ext { rs0 = pre_rs - max_ext; }
         if pre_qs - qs0 > max_ext { qs0 = pre_qs - max_ext; }
     }
@@ -1927,13 +1930,16 @@ pub fn align_anchors(
             qe0 = qe0_tmp;
         }
 
-        // SEED_SELF: clamp rightward extension distance to |q-r| of the chain's
-        // LAST original anchor (pre-trim).
+        // SEED_SELF: clamp rightward extension to |q-r| of LAST pre-trim
+        // anchor. Same coord-system issue as the left clamp: `pre_qe` is
+        // absolute, `pre_re` is region-relative after the anchor rebase;
+        // compute max_ext in absolute coords.
         if !anchors.is_empty() && (anchors[0].y & crate::align::map::SEED_SELF) != 0 {
             let last_idx = anchors.len() - 1;
             let pre_qe = anchors[last_idx].query_pos() + 1;
             let pre_re = anchors[last_idx].ref_pos() + 1;
-            let max_ext = (pre_qe - pre_re).unsigned_abs() as i32;
+            let pre_re_abs = pre_re + ref_offset;
+            let max_ext = (pre_qe - pre_re_abs).unsigned_abs() as i32;
             if re0 - pre_re > max_ext { re0 = pre_re + max_ext; }
             if qe0 - pre_qe > max_ext { qe0 = pre_qe + max_ext; }
         }
