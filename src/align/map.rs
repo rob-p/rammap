@@ -508,11 +508,14 @@ pub fn compute_bounds_from_squeezed(
         let mut j = sq_start as i64 - 1;
         while j >= 0 {
             let aj = &squeezed[j as usize];
-            if aj.ref_id_strand() != rid_strand { break; }
+            if aj.ref_id_strand() != rid_strand {
+                break;
+            }
             let span_j = aj.query_span();
             let xj = aj.ref_pos() + 1 - span_j;
             let yj = aj.query_pos() + 1 - span_j;
-            if xj < rs0_pre && yj < qs0_pre {
+            let qual = xj < rs0_pre && yj < qs0_pre;
+            if qual {
                 l += 1;
                 if l > min_cnt {
                     let dist = std::cmp::max(rs0_pre - xj, qs0_pre - yj);
@@ -1019,13 +1022,17 @@ pub fn map_query_multi(
                 PC_RESCUE_COUNT.fetch_add(1, Relaxed);
                 PC_RESCUE_ANCHORS.fetch_add(chains.len() as u64, Relaxed);
 
+                // chains is the output of the prior chain pass and is no longer
+                // needed once we reassign below, so re-use it in place: truncate to
+                // n_a, sort by (ref_id_strand, x), pass to the rescue call. Saves
+                // an n_a × 16-byte clone per rescue trigger.
                 let n_a: usize = u.iter().map(|&v| (v & 0xFFFFFFFF) as usize).sum();
-                let mut rescue_anchors: Vec<Minimizer> = chains[..n_a].to_vec();
-                radix_sort_128x(&mut rescue_anchors);
+                chains.truncate(n_a);
+                radix_sort_128x(&mut chains);
 
                 let rescue_params = ChainingParams { bandwidth: opt.chaining.bandwidth_long, ..opt.chaining.clone() };
                 let (u2, chains2) = chain_anchors_rmq(
-                    &rescue_params, &mut rescue_anchors, &mut ctx.chain_bufs,
+                    &rescue_params, &mut chains, &mut ctx.chain_bufs,
                 );
 
                 u = u2;
@@ -1361,13 +1368,17 @@ pub fn map_query(
                 PC_RESCUE_COUNT.fetch_add(1, Relaxed);
                 PC_RESCUE_ANCHORS.fetch_add(chains.len() as u64, Relaxed);
 
+                // chains is the output of the prior chain pass and is no longer
+                // needed once we reassign below, so re-use it in place: truncate to
+                // n_a, sort by (ref_id_strand, x), pass to the rescue call. Saves
+                // an n_a × 16-byte clone per rescue trigger.
                 let n_a: usize = u.iter().map(|&v| (v & 0xFFFFFFFF) as usize).sum();
-                let mut rescue_anchors: Vec<Minimizer> = chains[..n_a].to_vec();
-                radix_sort_128x(&mut rescue_anchors);
+                chains.truncate(n_a);
+                radix_sort_128x(&mut chains);
 
                 let rescue_params = ChainingParams { bandwidth: opt.chaining.bandwidth_long, ..opt.chaining.clone() };
                 let (u2, chains2) = chain_anchors_rmq(
-                    &rescue_params, &mut rescue_anchors, &mut ctx.chain_bufs,
+                    &rescue_params, &mut chains, &mut ctx.chain_bufs,
                 );
 
                 u = u2;
