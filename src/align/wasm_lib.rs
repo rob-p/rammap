@@ -275,17 +275,16 @@ pub fn align_wasm(target_fasta: &str, query_fasta: &str, output_sam: bool, is_sp
 #[wasm_bindgen]
 pub fn force_align_wasm(tseq: &str, qseq: &str) -> String {
     use crate::align::sketch::Minimizer;
-    use crate::align::extend::{align_anchors, AlignAnchorContext, fmt_cigar};
+    use crate::align::extend::{align_anchors, AlignAnchorContext, encode_nt4_byte, fmt_cigar};
 
-    let tseq_bytes = tseq.as_bytes();
-    let qseq_bytes = qseq.as_bytes();
+    let mut tseq_nt4: Vec<u8> = tseq.as_bytes().iter().copied().map(encode_nt4_byte).collect();
+    let qseq_nt4: Vec<u8> = qseq.as_bytes().iter().copied().map(encode_nt4_byte).collect();
 
     let x: u64 = 0;
     let y: u64 = 1u64 << 32;
 
     let mut anchors = vec![Minimizer { x, y }];
 
-    let mut ctx = AlignmentContext::new();
     let mut opt = MapOptions::default();
     opt.filtering.is_splice = false;
     opt.chaining.min_chain_score = 0;
@@ -293,7 +292,7 @@ pub fn force_align_wasm(tseq: &str, qseq: &str) -> String {
     opt.alignment.min_dp_max = i32::MIN;
 
     let call_ctx = AlignAnchorContext {
-        seed_bounds: (0, 0, tseq_bytes.len() as i32, qseq_bytes.len() as i32),
+        seed_bounds: (0, 0, tseq_nt4.len() as i32, qseq_nt4.len() as i32),
         rev: false,
         rid: 0,
         splice_flag: AlignFlags::empty(),
@@ -305,10 +304,10 @@ pub fn force_align_wasm(tseq: &str, qseq: &str) -> String {
     };
     let aln_result = align_anchors(
         &mut anchors,
-        qseq_bytes,
-        tseq_bytes,
+        &qseq_nt4,
+        &mut tseq_nt4,
+        None,
         &opt,
-        &mut ctx,
         &call_ctx,
     );
 
