@@ -2770,8 +2770,32 @@ pub(super) unsafe fn extend_splice_neon_impl(
                 max_h = h_en0;
                 max_t = en0;
 
-                // Scalar H[] update (matches NEON extd2 pattern)
+                // Process [st0..en0) in groups of 4, matching the SSE/AVX kernels'
+                // 4-lane max reduction (and the scalar reference). A plain linear
+                // scan picks a different cell among equal-max ties, diverging from
+                // the other backends. See the matching scan in dual.rs.
+                let en1 = st0 + (en0 - st0) / 4 * 4;
+                let mut lane_h = [max_h; 4];
+                let mut lane_t = [max_t; 4];
                 let mut t = st0;
+                while t < en1 {
+                    for i in 0..4i32 {
+                        let pos = (t + i) as usize;
+                        let hv = *h_ptr.add(pos) + *v8_ptr.add(pos) as i8 as i32;
+                        *h_ptr.add(pos) = hv;
+                        if hv > lane_h[i as usize] {
+                            lane_h[i as usize] = hv;
+                            lane_t[i as usize] = t;
+                        }
+                    }
+                    t += 4;
+                }
+                for i in 0..4i32 {
+                    if max_h < lane_h[i as usize] {
+                        max_h = lane_h[i as usize];
+                        max_t = lane_t[i as usize] + i;
+                    }
+                }
                 while t < en0 {
                     *h_ptr.add(t as usize) += *v8_ptr.add(t as usize) as i8 as i32;
                     if *h_ptr.add(t as usize) > max_h {

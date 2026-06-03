@@ -371,6 +371,30 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_neon_dual_affine_tiebreak_regression() {
+        // Regression: the NEON exact-max scan used a plain linear scan and so
+        // picked a different equal-score endpoint than the scalar/SSE/AVX
+        // kernels (which use a 4-lane max reduction), producing a different but
+        // equal-score CIGAR. This minimal case (delta-debugged from real
+        // map-hifi HiFi reads) reproduced the divergence; NEON must now match
+        // scalar exactly. See extend_dual_affine_neon_impl max tracking.
+        let q: Vec<u8> = "12130130110130130310130110130130110130110130130330110130130130130110130110110110130110110110110130130310130110130130110130130130330110132130110130130130130130310130110110130110130110110130110130110110130130310130110130110130130110130110130130330110130130110130110130130110110130110130130".bytes().map(|b| b - b'0').collect();
+        let t: Vec<u8> = "1301101101101101101301101101301301301101101101101101101101301101101301101101301101101101101301101101101101301301101101101101101301301301301101101101101301101101301101101301101101101101301101101301101101101101301101101101101103301301101101101101301101101101101101301101101".bytes().map(|b| b - b'0').collect();
+        let mut sm = [0i8; 25];
+        for i in 0..4 { for j in 0..4 { sm[i*5+j] = if i==j {1} else {-4}; } sm[i*5+4] = -1; }
+        for j in 0..5 { sm[4*5+j] = -1; }
+        let (go, ge, go2, ge2) = (6i8, 2i8, 26i8, 1i8);
+        let (bw, zd, eb, flags) = (751i32, 400i32, -1i32, 0xc2i32);
+        let mut es = DpResult::default();
+        extend_dual_affine_scalar(&q, &t, 5, &sm, go as i32, ge as i32, go2 as i32, ge2 as i32, bw, zd, eb, flags, &mut es);
+        let mut en = DpResult::default();
+        unsafe { extend_dual_affine_neon_impl(&q, &t, 5, &sm, go, ge, go2, ge2, bw, zd, eb, flags, &mut en); }
+        assert_eq!(en.score, es.score, "NEON score must match scalar");
+        assert_eq!(en.cigar, es.cigar, "NEON CIGAR must match scalar (max-position tie-break parity)");
+    }
+
+    #[test]
     fn test_neon_dual_affine_small() {
         // Small test case for easier debugging
         // Query: 10 A's, Target: 5 A's (need 5bp insertion)

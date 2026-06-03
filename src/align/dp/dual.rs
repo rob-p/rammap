@@ -107,6 +107,7 @@ pub fn extend_dual_affine(
         extend_dual_affine_neon_impl(qseq, tseq, alphabet_size, score_matrix, gap_open, gap_extend, gap_open2, gap_extend2, bandwidth, z_drop, end_bonus, flags, result);
     }
 
+
     #[cfg(target_arch = "x86_64")]
     {
         if super::use_avx512() {
@@ -606,8 +607,32 @@ pub(super) unsafe fn extend_dual_affine_neon_impl(
                 max_h = h_en0;
                 max_t = en0;
 
-                // Process [st0..en0) scalar (NEON doesn't have convenient i32 SIMD here)
+                // Process [st0..en0) in groups of 4, matching the SSE/AVX kernels'
+                // 4-lane max reduction (and the scalar reference, which mimics it).
+                // A plain linear scan here picks a different cell among equal-max
+                // ties, which diverges from the other backends on tie-break.
+                let en1 = st0 + (en0 - st0) / 4 * 4;
+                let mut lane_h = [max_h; 4];
+                let mut lane_t = [max_t; 4];
                 let mut t = st0;
+                while t < en1 {
+                    for i in 0..4i32 {
+                        let pos = (t + i) as usize;
+                        let hv = *h_ptr.add(pos) + *v8_ptr.add(pos) as i8 as i32;
+                        *h_ptr.add(pos) = hv;
+                        if hv > lane_h[i as usize] {
+                            lane_h[i as usize] = hv;
+                            lane_t[i as usize] = t;
+                        }
+                    }
+                    t += 4;
+                }
+                for i in 0..4i32 {
+                    if max_h < lane_h[i as usize] {
+                        max_h = lane_h[i as usize];
+                        max_t = lane_t[i as usize] + i;
+                    }
+                }
                 while t < en0 {
                     *h_ptr.add(t as usize) += *v8_ptr.add(t as usize) as i8 as i32;
                     if *h_ptr.add(t as usize) > max_h {
