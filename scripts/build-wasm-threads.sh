@@ -23,6 +23,7 @@ RUSTFLAGS="\
 -C link-arg=--export=__tls_align \
 -C link-arg=--export=__tls_base" \
   rustup run nightly cargo build \
+    -p rammap-core \
     --target wasm32-unknown-unknown \
     --release \
     --features wasm-threads \

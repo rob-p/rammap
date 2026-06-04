@@ -42,10 +42,15 @@ compatible with [minimap2-rs](https://github.com/jguhlin/minimap2-rs).
 
 ```toml
 [dependencies]
-rammap = { path = "../rammap", default-features = false, features = ["parallel"] }
+# The library is published as `rammap-core` but imported in code as `rammap`
+# (e.g. `use rammap::api::Aligner;`).
+rammap-core = { version = "1.1.0", default-features = false, features = ["parallel"] }
 ```
 
-Available features: `parallel` (rayon-based threading), `cli` (CLI deps — only needed for the binary), `wasm-threads` (browser-side rayon for WASM builds), `jemalloc` / `mimalloc` (opt-in global allocators; off by default).
+Library features (on `rammap-core`): `parallel` (rayon-based threading), `wasm-threads`
+(browser-side rayon for WASM builds). The CLI is a separate crate (`rammap`, which
+depends on `rammap-core`) and provides the binary plus the `jemalloc` / `mimalloc`
+opt-in global allocators (off by default).
 
 ### Example
 
@@ -213,11 +218,11 @@ The DP engine automatically selects the best SIMD backend (AVX512 > AVX2 > SSE4.
 ## Building
 
 ```bash
-# Full build (CLI + library)
+# Full build (CLI + library) — builds both workspace crates
 cargo build --release
 
 # Library only (no CLI dependencies)
-cargo build --lib --release --no-default-features --features parallel
+cargo build -p rammap-core --release --no-default-features --features parallel
 
 # Run tests
 cargo test

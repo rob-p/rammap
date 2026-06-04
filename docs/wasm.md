@@ -40,7 +40,6 @@ python3 scripts/serve.py
 | `scripts/build-wasm.sh` | Single-threaded build script |
 | `scripts/build-wasm-threads.sh` | Multi-threaded build script |
 | `scripts/serve.py` | Dev server with COOP/COEP headers |
-| `examples/wasm_bench.rs` | CLI benchmark via WASI (wasmtime) |
 
 ### SIMD128 Coverage
 
@@ -173,12 +172,18 @@ cargo install wasm-bindgen-cli
 bash scripts/build-wasm.sh
 ```
 
-Uses stable Rust. Output in `pkg/`. No special browser requirements.
+Uses stable Rust. Output in `pkg/` at the repo root. No special browser requirements.
 
-Equivalent to:
+The wasm bindings live in the `rammap-core` library crate (whose crate name is
+`rammap`, so the wasm-pack artifact is `pkg/rammap.js`). The script builds that
+crate and relocates its `pkg/` to the repo root so the `web/` demo's
+`../pkg/rammap.js` import resolves. Equivalent to:
 ```bash
-wasm-pack build --target web --release --no-default-features
+(cd rammap-core && wasm-pack build --target web --release --no-default-features)
+mv rammap-core/pkg pkg
 ```
+(Don't pass `wasm-pack`'s `--out-dir` — it's forwarded to cargo as the
+nightly-only `--artifact-dir`.)
 
 ### Multi-Threaded Build
 
@@ -210,11 +215,17 @@ The build script:
 
 ### Cargo.toml Features
 
+The WASM bindings build from the `rammap-core` library crate. Its features:
+
 | Feature | Effect |
 |---------|--------|
-| (default) | `parallel` + `cli` — native build with rayon + clap |
+| `parallel` (default) | Enables `rayon` for native parallelism |
 | `wasm-threads` | Enables `rayon` + `wasm-bindgen-rayon` for browser threading |
-| (no features) | Single-threaded WASM, no CLI |
+| (no features, i.e. `--no-default-features`) | Single-threaded WASM |
+
+The CLI is a separate crate (`rammap`, which depends on `rammap-core`) and owns
+the binary plus the allocator opt-ins (`jemalloc`/`mimalloc`); there is no longer
+a `cli` feature on the library.
 
 The `web_spin_lock` feature on rayon is always enabled — it replaces futex-based
 locks with spin locks on WASM (required because `Atomics.wait` traps on the
@@ -264,29 +275,6 @@ parallelism for the alignment loop.
   - `Cross-Origin-Opener-Policy: same-origin`
   - `Cross-Origin-Embedder-Policy: require-corp`
 
-### WASI Benchmark (wasmtime)
-
-For benchmarking WASM performance outside the browser:
-
-```bash
-# Install wasmtime
-curl https://wasmtime.dev/install.sh -sSf | bash
-
-# Build WASI benchmark binary
-cargo build --release --target wasm32-wasip1 --example wasm_bench --no-default-features
-
-# Run (single-threaded, SIMD128 enabled)
-wasmtime run --dir / \
-  -- target/wasm32-wasip1/release/examples/wasm_bench.wasm \
-  /path/to/reference.fa /path/to/queries.fq [preset]
-
-# Compare with native single-threaded
-./target/release/examples/wasm_bench reference.fa queries.fq [preset]
-```
-
-The benchmark binary reads files via WASI, builds an index, aligns all queries,
-and outputs PAF to stdout with timing breakdown to stderr.
-
 ---
 
 ## Testing
@@ -308,21 +296,10 @@ Tests in `wasm_lib.rs`:
 
 ### Concordance Testing
 
-WASM output should be identical to native for the same input. Verify with:
-
-```bash
-# WASM via wasmtime
-wasmtime run --dir / \
-  -- target/wasm32-wasip1/release/examples/wasm_bench.wasm \
-  tests/inttest/chr20.fa /tmp/reads.fq > /tmp/wasm.paf
-
-# Native single-threaded
-./target/release/examples/wasm_bench \
-  tests/inttest/chr20.fa /tmp/reads.fq > /tmp/native.paf
-
-# Compare
-diff <(sort /tmp/wasm.paf) <(sort /tmp/native.paf)
-```
+WASM alignment output should be identical to native for the same input. The
+`wasm-pack test --node` unit tests above exercise this on small cases; for
+larger inputs, diff the browser demo's output (`web/`) against the native
+`rammap` CLI on the same reference and reads.
 
 ---
 
@@ -354,7 +331,7 @@ to scalar, and total slowdown increases to ~1.84x.
 ## Limitations
 
 - **Single-threaded WASI**: wasmtime does not yet support WASI threads for Rust's
-  `std::thread`. The WASI benchmark is always single-threaded.
+  `std::thread`, so WASI builds are always single-threaded.
 - **Browser threading requires headers**: `SharedArrayBuffer` needs COOP/COEP HTTP
   headers. Embedding in iframes requires the parent page to also send these headers.
 - **Memory**: WASM linear memory grows on demand but has a configured maximum (4 GB

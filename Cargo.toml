@@ -1,70 +1,16 @@
-[package]
-name = "rammap"
-version = "1.0.0"
+[workspace]
+resolver = "2"
+members = ["rammap-core", "rammap"]
+
+[workspace.package]
+version = "1.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/jwanglab/rammap"
+# Shared across both crates; the path is resolved relative to the workspace root.
+readme = "README.md"
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
-[features]
-# Default: Rust system allocator (no C-toolchain dependency).
-default = ["parallel", "cli"]
-parallel = ["rayon"]
-cli = ["clap", "env_logger"]
-wasm-threads = ["rayon", "wasm-bindgen-rayon"]
-
-# Allocator opt-ins (need a C toolchain at build time; mimalloc wins if both are set):
-#   cargo build --release                       → Rust system allocator (default)
-#   cargo build --release --features jemalloc   → jemalloc (~2.5s faster wall on BGI 5M SR PE)
-#   cargo build --release --features mimalloc   → mimalloc (~1s faster than system, ~1.2s slower than jemalloc)
-jemalloc = ["dep:tikv-jemallocator"]
-mimalloc = ["dep:mimalloc"]
-
-[dependencies]
-# Alignment module
-serde = { version = "1", features = ["derive"] }
-bincode = "1"
-bitflags = "2"
-rustc-hash = "2"
-hashbrown = { version = "0.15", features = ["serde"] }
-byteorder = "1"
-
-# Parallelism
-rayon = { version = "1", optional = true, features = ["web_spin_lock"] }
-
-# FASTA/FASTQ parsing
-flate2 = "1"
-memchr = "2"
-
-# Logging, errors (used by library)
-log = "0.4"
-thiserror = "2"
-anyhow = "1"
-
-# CLI-only (optional, enabled by default via `cli` feature)
-clap = { version = "4", features = ["derive"], optional = true }
-env_logger = { version = "0.11", optional = true }
-
-# WASM-only dependencies
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-web-time = "1"
-wasm-bindgen = "0.2"
-wasm-bindgen-rayon = { version = "1.2", optional = true }
-
-[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-wasm-bindgen-test = "0.3"
-
-# Native-only dependencies
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-indicatif = { version = "0.17", features = ["rayon"] }
-tikv-jemallocator = { version = "0.6", optional = true }
-mimalloc = { version = "0.1", default-features = false, optional = true }
-
-[[bin]]
-name = "rammap"
-path = "src/main.rs"
-required-features = ["cli"]
-
+# Shared release profile (applies to all workspace members).
 [profile.release]
 opt-level = 3
 lto = "fat"
